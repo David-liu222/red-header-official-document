@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Center ordinary DOCX tables without changing their internal content or format.
+"""Center ordinary DOCX tables and force printable table borders to solid lines.
 
 The document package is copied directly. By default only w:tblPr/w:jc is
-added or updated. With --repeat-first-row, the sole extra change is
-w:tblHeader on each table's original first row, so the header repeats when
-that table naturally continues to a new page.
+added or updated, and table border line types are normalized to w:val="single".
+With --repeat-first-row, the sole extra pagination change is w:tblHeader on each
+table's original first row, so the header repeats when that table naturally
+continues to a new page.
 """
 
 from __future__ import annotations
@@ -16,9 +17,14 @@ from pathlib import Path
 
 
 TBL_PR = re.compile(rb"(<w:tblPr(?:\s[^>]*)?>)(.*?)(</w:tblPr>)", re.DOTALL)
+TBL_BORDERS = re.compile(rb"(<w:tblBorders(?:\s[^>]*)?>)(.*?)(</w:tblBorders>)", re.DOTALL)
+TC_BORDERS = re.compile(rb"(<w:tcBorders(?:\s[^>]*)?>)(.*?)(</w:tcBorders>)", re.DOTALL)
 JC = re.compile(rb"<w:jc\b[^>]*/>")
 TBL_IND = re.compile(rb"<w:tblInd\b[^>]*/>")
 TBL_POSITION = re.compile(rb"<w:tblpPr\b[^>]*/>")
+VAL_ATTR = re.compile(rb'\sw:val="[^"]*"')
+TABLE_BORDER_NAMES = (b"top", b"left", b"bottom", b"right", b"insideH", b"insideV")
+ALL_BORDER_NAMES = TABLE_BORDER_NAMES + (b"tl2br", b"tr2bl")
 FIRST_ROW = re.compile(
     rb"(<w:tblPr(?:\s[^>]*)?>.*?</w:tblPr>.*?<w:tr(?:\s[^>]*)?>)(.*?)(</w:tr>)",
     re.DOTALL,
@@ -26,8 +32,50 @@ FIRST_ROW = re.compile(
 TR_PR = re.compile(rb"(<w:trPr(?:\s[^>]*)?>.*?)(</w:trPr>)", re.DOTALL)
 
 
+def default_border(name: bytes) -> bytes:
+    return b'<w:' + name + b' w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+
+
+def force_border_element_single(element: bytes) -> bytes:
+    """Change only the border line type, preserving width/color/space/etc."""
+    if VAL_ATTR.search(element):
+        return VAL_ATTR.sub(b' w:val="single"', element, count=1)
+    return element[:-2] + b' w:val="single"/>'
+
+
+def force_border_children_single(content: bytes) -> bytes:
+    for name in ALL_BORDER_NAMES:
+        pattern = re.compile(rb"<w:" + name + rb"\b[^>]*/>")
+        content = pattern.sub(lambda item: force_border_element_single(item.group(0)), content)
+    return content
+
+
+def force_tbl_borders(content: bytes) -> bytes:
+    """Ensure every table has printable solid outer and inner grid borders."""
+    def update_container(match: re.Match[bytes]) -> bytes:
+        opening, inner, closing = match.groups()
+        inner = force_border_children_single(inner)
+        for name in TABLE_BORDER_NAMES:
+            if not re.search(rb"<w:" + name + rb"\b", inner):
+                inner += default_border(name)
+        return opening + inner + closing
+
+    if TBL_BORDERS.search(content):
+        return TBL_BORDERS.sub(update_container, content, count=1)
+    return content + b"<w:tblBorders>" + b"".join(default_border(name) for name in TABLE_BORDER_NAMES) + b"</w:tblBorders>"
+
+
+def force_cell_borders(content: bytes) -> bytes:
+    """Normalize existing cell and diagonal borders without adding cell layout."""
+    return TC_BORDERS.sub(
+        lambda match: match.group(1) + force_border_children_single(match.group(2)) + match.group(3),
+        content,
+    )
+
+
 def center_table_properties(match: re.Match[bytes]) -> bytes:
     opening, content, closing = match.groups()
+    content = force_tbl_borders(content)
     # A floating table can have separately positioned VML lines or drawings
     # (for example a diagonal header line). Its tblpPr/jc/tblInd form one
     # coordinate system with those objects, so changing the table position
@@ -66,6 +114,7 @@ def apply(input_path: Path, output_path: Path, repeat_first_row: bool) -> tuple[
     with zipfile.ZipFile(input_path, "r") as source:
         document_xml = source.read("word/document.xml")
         updated_xml, centered = TBL_PR.subn(center_table_properties, document_xml)
+        updated_xml = force_cell_borders(updated_xml)
         if centered == 0:
             raise ValueError("未在 word/document.xml 中找到表格。")
         repeated = 0
@@ -91,7 +140,7 @@ def apply(input_path: Path, output_path: Path, repeat_first_row: bool) -> tuple[
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="普通嵌入式表格整体居中；浮动表格保持原定位；可选设置原首行为续页表头")
+    parser = argparse.ArgumentParser(description="普通嵌入式表格整体居中；浮动表格保持原定位；强制所有表格边框为single实线；可选设置原首行为续页表头")
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--repeat-first-row", action="store_true", help="仅为续页重复原首行表头")
@@ -99,7 +148,7 @@ def main() -> None:
     if args.input.resolve() == args.output.resolve():
         raise SystemExit("禁止覆盖输入文件，请指定新输出路径。")
     centered, repeated = apply(args.input, args.output, args.repeat_first_row)
-    print(f"已处理表格：{centered} 个（浮动表格已保留原定位）；已设置续页表头：{repeated} 个")
+    print(f"已处理表格：{centered} 个（浮动表格已保留原定位）；已强制表格边框为 single 实线；已设置续页表头：{repeated} 个")
 
 
 if __name__ == "__main__":
