@@ -1,0 +1,6 @@
+interface:
+  display_name: "套红头公文"
+  short_description: "严格按固定红头公文规则生成、排版并复核 Word 文件"
+  default_prompt: "使用 $red-header-official-document 严格按既定套红头规则生成并复核这份公文。"
+policy:
+  allow_implicit_invocation: true
