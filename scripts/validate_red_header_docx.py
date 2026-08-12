@@ -12,6 +12,7 @@ import argparse
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 try:
@@ -43,6 +44,44 @@ def nonempty_paragraphs(doc):
 
 def has_paragraph_border(paragraph):
     return bool(paragraph._p.xpath("./w:pPr/w:pBdr"))
+
+
+TABLE_RE = re.compile(rb"<w:tbl(?:\s[^>]*)?>.*?</w:tbl>", re.DOTALL)
+TBL_BORDERS_RE = re.compile(rb"<w:tblBorders(?:\s[^>]*)?>(.*?)</w:tblBorders>", re.DOTALL)
+BORDER_ELEMENT_RE = re.compile(rb"<w:(top|left|bottom|right|insideH|insideV|tl2br|tr2bl)\b([^>]*)/>")
+REQUIRED_TABLE_BORDERS = (b"top", b"left", b"bottom", b"right", b"insideH", b"insideV")
+
+
+def attr_value(attrs: bytes, name: bytes) -> bytes | None:
+    match = re.search(rb"\s" + re.escape(name) + rb'="([^"]*)"', attrs)
+    return match.group(1) if match else None
+
+
+def table_border_issues(docx_path: Path) -> tuple[int, list[dict]]:
+    """Return issues for non-solid or missing printable table borders."""
+    with zipfile.ZipFile(docx_path, "r") as package:
+        document_xml = package.read("word/document.xml")
+    issues: list[dict] = []
+    tables = TABLE_RE.findall(document_xml)
+    for table_idx, table_xml in enumerate(tables, 1):
+        tbl_borders = TBL_BORDERS_RE.search(table_xml)
+        if not tbl_borders:
+            issues.append({"table": table_idx, "issue": "missing_tblBorders"})
+        else:
+            present = {name for name, attrs in BORDER_ELEMENT_RE.findall(tbl_borders.group(1))}
+            for required in REQUIRED_TABLE_BORDERS:
+                if required not in present:
+                    issues.append({"table": table_idx, "issue": "missing_table_border", "border": required.decode()})
+        for name, attrs in BORDER_ELEMENT_RE.findall(table_xml):
+            value = attr_value(attrs, b"w:val")
+            if value != b"single":
+                issues.append({
+                    "table": table_idx,
+                    "border": name.decode(),
+                    "val": None if value is None else value.decode(errors="replace"),
+                    "issue": "not_single",
+                })
+    return len(tables), issues
 
 
 def main():
@@ -182,6 +221,14 @@ def main():
         expected_values.append(("矿名", args.expected_mine))
     for label, value in expected_values:
         add(f"包含{label}", "pass" if value in full_text else "review", value, "error" if value not in full_text else "info")
+
+    table_count, border_issues = table_border_issues(args.docx)
+    add(
+        "所有表格边框均为single实线",
+        "pass" if table_count == 0 or not border_issues else "review",
+        {"table_count": table_count, "issues": border_issues[:30]},
+        "error" if border_issues else "info",
+    )
 
     if not args.title:
         add("标题黑体二号且不加粗", "manual", "请传入 --title 后自动检查标题段落")
