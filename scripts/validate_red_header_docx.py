@@ -58,12 +58,14 @@ def attr_value(attrs: bytes, name: bytes) -> bytes | None:
 
 
 def table_border_issues(docx_path: Path) -> tuple[int, list[dict]]:
-    """Return issues for non-solid or missing printable table borders."""
+    """Return issues for non-solid/missing borders and unsafe floating tables."""
     with zipfile.ZipFile(docx_path, "r") as package:
         document_xml = package.read("word/document.xml")
     issues: list[dict] = []
     tables = TABLE_RE.findall(document_xml)
     for table_idx, table_xml in enumerate(tables, 1):
+        if b"<w:tblpPr" in table_xml:
+            issues.append({"table": table_idx, "issue": "floating_table_text_wrapping", "tag": "w:tblpPr"})
         tbl_borders = TBL_BORDERS_RE.search(table_xml)
         if not tbl_borders:
             issues.append({"table": table_idx, "issue": "missing_tblBorders"})
