@@ -77,7 +77,9 @@ def main() -> int:
     sign_type = value(payload, "signType") or value(red, "sign_type") or "auto"
     if sign_type not in {"auto", "external", "internal"}:
         warnings.append(f"发文类型取值异常：{sign_type}")
-    output_mode = value(payload, "outputMode") or value(red, "output_mode") or "docxPdf"
+    output_mode = value(payload, "outputMode") or value(red, "output_mode") or "docxOnly"
+    if output_mode == "docxPdf":
+        warnings.append("输出模式 docxPdf 已废弃：按 docxOnly 执行，不产出 PDF")
     if output_mode not in {"docxPdf", "docxOnly", "legacyDoc"}:
         warnings.append(f"输出模式取值异常：{output_mode}")
 

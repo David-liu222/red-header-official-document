@@ -23,6 +23,7 @@ def visible_files(output_dir: Path) -> list[Path]:
     return sorted(
         path for path in output_dir.rglob("*")
         if path.is_file() and not path.name.startswith(".") and path.name not in ignored
+        and not any(part.startswith("render") for part in path.relative_to(output_dir).parts[:-1])
     )
 
 
@@ -34,21 +35,15 @@ def main() -> int:
     files = visible_files(output_dir)
     names = [path.name for path in files]
     docx_files = [name for name in names if name.lower().endswith(".docx")]
-    report_files = [
-        name for name in names
-        if ("验收" in name or "报告" in name or "检查" in name) and name.lower().endswith((".docx", ".md", ".pdf", ".txt"))
-    ]
     errors: list[str] = []
     warnings: list[str] = []
 
     if not docx_files:
         errors.append("缺少可下载的套红头 DOCX")
-    if not report_files:
-        errors.append("缺少验收报告或检查报告")
     if any(path.stat().st_size == 0 for path in files):
         errors.append("存在 0 字节输出文件")
-    if not any(name.lower().endswith(".pdf") for name in names):
-        warnings.append("未输出 PDF 预览；如 outputMode=docxPdf，应在报告中说明原因")
+    if any(name.lower().endswith(".pdf") for name in names):
+        errors.append("默认只产出 Word 文件，输出目录不应包含 PDF")
 
     result = {
         "ok": not errors,

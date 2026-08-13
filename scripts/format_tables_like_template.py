@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Center DOCX tables, disable text wrapping, and force solid borders.
+"""Center DOCX tables, disable text wrapping, force solid borders, and clean captions.
 
 The document package is copied directly. By default only w:tblPr/w:jc is
 added or updated, floating table positioning (w:tblpPr) is removed to prevent
@@ -7,6 +7,11 @@ surrounding text from wrapping vertically beside a table, and table border line
 types are normalized to w:val="single". With --repeat-first-row, the sole extra
 pagination change is w:tblHeader on each table's original first row, so the
 header repeats when that table naturally continues to a new page.
+
+The script also removes consecutive empty paragraphs immediately before a table
+when those paragraphs contain no text, page break, section properties, drawing,
+object, or field content. This fixes the common WPS/Word conversion artifact
+where a table caption and the table are separated by a large blank gap.
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ from pathlib import Path
 
 
 TBL_PR = re.compile(rb"(<w:tblPr(?:\s[^>]*)?>)(.*?)(</w:tblPr>)", re.DOTALL)
+TABLE_OPEN = re.compile(rb"<w:tbl(?:\s[^>]*)?>")
+P_OPEN = re.compile(rb"<w:p(?:\s[^>]*)?>")
 TBL_BORDERS = re.compile(rb"(<w:tblBorders(?:\s[^>]*)?>)(.*?)(</w:tblBorders>)", re.DOTALL)
 TC_BORDERS = re.compile(rb"(<w:tcBorders(?:\s[^>]*)?>)(.*?)(</w:tcBorders>)", re.DOTALL)
 JC = re.compile(rb"<w:jc\b[^>]*/>")
@@ -31,6 +38,50 @@ FIRST_ROW = re.compile(
     re.DOTALL,
 )
 TR_PR = re.compile(rb"(<w:trPr(?:\s[^>]*)?>.*?)(</w:trPr>)", re.DOTALL)
+CONTROL_IN_EMPTY_PARAGRAPH = re.compile(
+    rb"<w:(?:t|br|sectPr|drawing|pict|object|fldSimple|instrText|footnoteReference|endnoteReference)\b",
+    re.DOTALL,
+)
+
+
+def is_safe_empty_paragraph_before_table(paragraph: bytes) -> bool:
+    """Return True only for inert empty paragraphs safe to remove before tables."""
+    if CONTROL_IN_EMPTY_PARAGRAPH.search(paragraph):
+        return False
+    text_values = re.findall(rb"<w:t(?:\s[^>]*)?>(.*?)</w:t>", paragraph, re.DOTALL)
+    return all(value.strip() == b"" for value in text_values)
+
+
+def remove_empty_paragraphs_before_tables(document_xml: bytes) -> tuple[bytes, int]:
+    """Remove consecutive inert empty paragraphs directly before each table."""
+    removed = 0
+    position = 0
+    while True:
+        table_match = TABLE_OPEN.search(document_xml, position)
+        if table_match is None:
+            break
+        table_start = table_match.start()
+        previous_end = document_xml.rfind(b"</w:p>", 0, table_start)
+        if previous_end < 0:
+            position = table_match.end()
+            continue
+        previous_end += len(b"</w:p>")
+        if document_xml[previous_end:table_start].strip():
+            position = table_match.end()
+            continue
+        previous_paragraphs = list(P_OPEN.finditer(document_xml, 0, previous_end))
+        if not previous_paragraphs:
+            position = table_match.end()
+            continue
+        previous_start = previous_paragraphs[-1].start()
+        paragraph = document_xml[previous_start:previous_end]
+        if is_safe_empty_paragraph_before_table(paragraph):
+            document_xml = document_xml[:previous_start] + document_xml[previous_end:]
+            removed += 1
+            position = previous_start
+            continue
+        position = table_match.end()
+    return document_xml, removed
 
 
 def default_border(name: bytes) -> bytes:
@@ -112,10 +163,11 @@ def mark_first_row_as_repeat_header(match: re.Match[bytes]) -> bytes:
     return opening + content + closing
 
 
-def apply(input_path: Path, output_path: Path, repeat_first_row: bool, preserve_floating: bool) -> tuple[int, int, int]:
+def apply(input_path: Path, output_path: Path, repeat_first_row: bool, preserve_floating: bool) -> tuple[int, int, int, int]:
     """Copy a DOCX while changing only explicitly requested table metadata."""
     with zipfile.ZipFile(input_path, "r") as source:
         document_xml = source.read("word/document.xml")
+        document_xml, pretable_blanks_removed = remove_empty_paragraphs_before_tables(document_xml)
         floating_removed = 0 if preserve_floating else len(TBL_POSITION.findall(document_xml))
         updated_xml, centered = TBL_PR.subn(
             lambda match: center_table_properties(match, preserve_floating),
@@ -143,11 +195,11 @@ def apply(input_path: Path, output_path: Path, repeat_first_row: bool, preserve_
                 copied.flag_bits = info.flag_bits
                 copied.compress_type = info.compress_type
                 target.writestr(copied, data, compress_type=info.compress_type)
-    return centered, repeated, floating_removed
+    return centered, repeated, floating_removed, pretable_blanks_removed
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="表格整体居中；默认取消浮动/文字环绕；强制所有表格边框为single实线；可选设置原首行为续页表头")
+    parser = argparse.ArgumentParser(description="表格整体居中；默认取消浮动/文字环绕；清理表格前空段；强制所有表格边框为single实线；可选设置原首行为续页表头")
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--repeat-first-row", action="store_true", help="仅为续页重复原首行表头")
@@ -155,9 +207,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.input.resolve() == args.output.resolve():
         raise SystemExit("禁止覆盖输入文件，请指定新输出路径。")
-    centered, repeated, floating_removed = apply(args.input, args.output, args.repeat_first_row, args.preserve_floating)
+    centered, repeated, floating_removed, pretable_blanks_removed = apply(args.input, args.output, args.repeat_first_row, args.preserve_floating)
     floating_msg = "已保留浮动定位" if args.preserve_floating else f"已取消浮动/文字环绕定位：{floating_removed} 处"
-    print(f"已处理表格：{centered} 个；{floating_msg}；已强制表格边框为 single 实线；已设置续页表头：{repeated} 个")
+    print(f"已处理表格：{centered} 个；{floating_msg}；已清理表格前空段：{pretable_blanks_removed} 个；已强制表格边框为 single 实线；已设置续页表头：{repeated} 个")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 
 This intentionally reports evidence and does not rewrite the document. It is a
 first-pass check; red-header color/line placement and visual balance still need
-rendered PDF/PNG inspection.
+rendered page-image inspection.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ def has_paragraph_border(paragraph):
 
 TABLE_RE = re.compile(rb"<w:tbl(?:\s[^>]*)?>.*?</w:tbl>", re.DOTALL)
 TBL_BORDERS_RE = re.compile(rb"<w:tblBorders(?:\s[^>]*)?>(.*?)</w:tblBorders>", re.DOTALL)
+TC_BORDERS_RE = re.compile(rb"<w:tcBorders(?:\s[^>]*)?>(.*?)</w:tcBorders>", re.DOTALL)
 BORDER_ELEMENT_RE = re.compile(rb"<w:(top|left|bottom|right|insideH|insideV|tl2br|tr2bl)\b([^>]*)/>")
 REQUIRED_TABLE_BORDERS = (b"top", b"left", b"bottom", b"right", b"insideH", b"insideV")
 
@@ -74,15 +75,20 @@ def table_border_issues(docx_path: Path) -> tuple[int, list[dict]]:
             for required in REQUIRED_TABLE_BORDERS:
                 if required not in present:
                     issues.append({"table": table_idx, "issue": "missing_table_border", "border": required.decode()})
-        for name, attrs in BORDER_ELEMENT_RE.findall(table_xml):
-            value = attr_value(attrs, b"w:val")
-            if value != b"single":
-                issues.append({
-                    "table": table_idx,
-                    "border": name.decode(),
-                    "val": None if value is None else value.decode(errors="replace"),
-                    "issue": "not_single",
-                })
+        border_scopes = []
+        if tbl_borders:
+            border_scopes.append(tbl_borders.group(1))
+        border_scopes.extend(match.group(1) for match in TC_BORDERS_RE.finditer(table_xml))
+        for scope in border_scopes:
+            for name, attrs in BORDER_ELEMENT_RE.findall(scope):
+                value = attr_value(attrs, b"w:val")
+                if value != b"single":
+                    issues.append({
+                        "table": table_idx,
+                        "border": name.decode(),
+                        "val": None if value is None else value.decode(errors="replace"),
+                        "issue": "not_single",
+                    })
     return len(tables), issues
 
 
@@ -234,7 +240,7 @@ def main():
 
     if not args.title:
         add("标题黑体二号且不加粗", "manual", "请传入 --title 后自动检查标题段落")
-    add("红头颜色、红线、右下角落款、页码和上长下短", "manual", "需渲染 PDF/PNG 目测确认")
+    add("红头颜色、红线、右下角落款、页码和上长下短", "manual", "需渲染页面图片或用目标办公软件目测确认")
     add("序号层级、书名号间顿号、附件空行、结束语和落款分行", "manual", "需结合具体文稿语义确认")
 
     report = {"file": str(args.docx), "checks": checks, "summary": {"total": len(checks), "review": sum(c["status"] in {"review", "manual"} for c in checks), "failed": sum(c["status"] == "fail" for c in checks)}}
