@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Center ordinary DOCX tables and force printable table borders to solid lines.
+"""Center DOCX tables, disable text wrapping, and force solid borders.
 
 The document package is copied directly. By default only w:tblPr/w:jc is
-added or updated, and table border line types are normalized to w:val="single".
-With --repeat-first-row, the sole extra pagination change is w:tblHeader on each
-table's original first row, so the header repeats when that table naturally
-continues to a new page.
+added or updated, floating table positioning (w:tblpPr) is removed to prevent
+surrounding text from wrapping vertically beside a table, and table border line
+types are normalized to w:val="single". With --repeat-first-row, the sole extra
+pagination change is w:tblHeader on each table's original first row, so the
+header repeats when that table naturally continues to a new page.
 """
 
 from __future__ import annotations
@@ -73,15 +74,17 @@ def force_cell_borders(content: bytes) -> bytes:
     )
 
 
-def center_table_properties(match: re.Match[bytes]) -> bytes:
+def center_table_properties(match: re.Match[bytes], preserve_floating: bool) -> bytes:
     opening, content, closing = match.groups()
     content = force_tbl_borders(content)
-    # A floating table can have separately positioned VML lines or drawings
-    # (for example a diagonal header line). Its tblpPr/jc/tblInd form one
-    # coordinate system with those objects, so changing the table position
-    # would visually detach them. Preserve the whole outer positioning block.
-    if TBL_POSITION.search(content):
+    # Floating tables make Word/WPS wrap later paragraphs in the narrow space
+    # beside the table. In red-header official documents this creates the
+    # observed "文字跑到表格左侧/竖排" defect, so remove only the outer floating
+    # positioning by default. Table rows, cells, text, widths, merges and
+    # diagonal borders remain untouched.
+    if preserve_floating and TBL_POSITION.search(content):
         return opening + content + closing
+    content = TBL_POSITION.sub(b"", content)
 
     centered = b'<w:jc w:val="center"/>'
     # For ordinary inline tables, tblInd can oppose w:jc in WPS. Remove only
@@ -109,11 +112,15 @@ def mark_first_row_as_repeat_header(match: re.Match[bytes]) -> bytes:
     return opening + content + closing
 
 
-def apply(input_path: Path, output_path: Path, repeat_first_row: bool) -> tuple[int, int]:
+def apply(input_path: Path, output_path: Path, repeat_first_row: bool, preserve_floating: bool) -> tuple[int, int, int]:
     """Copy a DOCX while changing only explicitly requested table metadata."""
     with zipfile.ZipFile(input_path, "r") as source:
         document_xml = source.read("word/document.xml")
-        updated_xml, centered = TBL_PR.subn(center_table_properties, document_xml)
+        floating_removed = 0 if preserve_floating else len(TBL_POSITION.findall(document_xml))
+        updated_xml, centered = TBL_PR.subn(
+            lambda match: center_table_properties(match, preserve_floating),
+            document_xml,
+        )
         updated_xml = force_cell_borders(updated_xml)
         if centered == 0:
             raise ValueError("未在 word/document.xml 中找到表格。")
@@ -136,19 +143,21 @@ def apply(input_path: Path, output_path: Path, repeat_first_row: bool) -> tuple[
                 copied.flag_bits = info.flag_bits
                 copied.compress_type = info.compress_type
                 target.writestr(copied, data, compress_type=info.compress_type)
-    return centered, repeated
+    return centered, repeated, floating_removed
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="普通嵌入式表格整体居中；浮动表格保持原定位；强制所有表格边框为single实线；可选设置原首行为续页表头")
+    parser = argparse.ArgumentParser(description="表格整体居中；默认取消浮动/文字环绕；强制所有表格边框为single实线；可选设置原首行为续页表头")
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--repeat-first-row", action="store_true", help="仅为续页重复原首行表头")
+    parser.add_argument("--preserve-floating", action="store_true", help="保留 w:tblpPr 浮动定位；仅在正式模板明确要求时使用")
     args = parser.parse_args()
     if args.input.resolve() == args.output.resolve():
         raise SystemExit("禁止覆盖输入文件，请指定新输出路径。")
-    centered, repeated = apply(args.input, args.output, args.repeat_first_row)
-    print(f"已处理表格：{centered} 个（浮动表格已保留原定位）；已强制表格边框为 single 实线；已设置续页表头：{repeated} 个")
+    centered, repeated, floating_removed = apply(args.input, args.output, args.repeat_first_row, args.preserve_floating)
+    floating_msg = "已保留浮动定位" if args.preserve_floating else f"已取消浮动/文字环绕定位：{floating_removed} 处"
+    print(f"已处理表格：{centered} 个；{floating_msg}；已强制表格边框为 single 实线；已设置续页表头：{repeated} 个")
 
 
 if __name__ == "__main__":
