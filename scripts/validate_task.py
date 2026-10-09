@@ -77,6 +77,14 @@ def main() -> int:
     sign_type = value(payload, "signType") or value(red, "sign_type") or "auto"
     if sign_type not in {"auto", "external", "internal"}:
         warnings.append(f"发文类型取值异常：{sign_type}")
+    inspection = payload.get("inspectionMaterial", red.get("inspection_material", False))
+    if not isinstance(inspection, bool):
+        errors.append("inspectionMaterial 必须为 JSON 布尔值，不接受字符串代替")
+        inspection = False
+    if inspection:
+        notes.append("迎检内发文：生成和校验均须传 --inspection-material；无签发人/印发栏，不要求抄送及印数")
+        if sign_type == "external":
+            warnings.append("迎检标记与外发选择冲突：须确认文件类型，不静默当作普通内发文")
     output_mode = value(payload, "outputMode") or value(red, "output_mode") or "docxOnly"
     if output_mode == "docxPdf":
         warnings.append("输出模式 docxPdf 已废弃：按 docxOnly 执行，不产出 PDF")
@@ -101,6 +109,7 @@ def main() -> int:
         },
         "source_file_count": len(source_files),
         "sign_type": sign_type,
+        "inspection_material": inspection,
         "output_mode": output_mode,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))

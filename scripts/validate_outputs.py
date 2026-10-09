@@ -22,7 +22,8 @@ def visible_files(output_dir: Path) -> list[Path]:
     }
     return sorted(
         path for path in output_dir.rglob("*")
-        if path.is_file() and not path.name.startswith(".") and path.name not in ignored
+        if path.is_file() and not any(part.startswith('.') for part in path.relative_to(output_dir).parts)
+        and not path.name.startswith('~$') and path.name not in ignored
         and not any(part.startswith("render") for part in path.relative_to(output_dir).parts[:-1])
     )
 
