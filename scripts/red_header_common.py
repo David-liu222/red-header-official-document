@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from docx.oxml.ns import qn
+from docx.text.run import Run
 
 CHINESE_NUMBER = r"[一二三四五六七八九十百]+"
 CLOSINGS = ("特此请示", "特此报告", "特此通知", "特此函复", "特此复函", "妥否，请批示", "妥否请批示")
@@ -113,6 +115,127 @@ def on(value):
     return value not in (None, '0', 'false', 'off')
 
 
+def effective_bold(run):
+    """Bold is a toggle in styles and an absolute value in direct formatting."""
+    state = False
+    defaults = run.part.package.main_document_part.styles.element.xpath('./w:docDefaults/w:rPrDefault/w:rPr/w:b')
+    if defaults:
+        state = on(defaults[0].get(qn('w:val'), '1'))
+    chains = (list(style_chain(run._parent.style)), list(style_chain(run.style)))
+    for chain in chains:
+        for style in reversed(chain):
+            node = style.find(qn('w:rPr'))
+            node = node.find(qn('w:b')) if node is not None else None
+            if node is not None and on(node.get(qn('w:val'), '1')):
+                state = not state
+    if run._r.rPr is not None:
+        direct = run._r.rPr.find(qn('w:b'))
+        if direct is not None:
+            state = on(direct.get(qn('w:val'), '1'))
+    return state
+
+
+def text_runs(paragraph):
+    return [Run(node, paragraph) for node in paragraph._p.xpath('./w:r | ./w:hyperlink/w:r')]
+
+
+def bold_snapshot(paragraph):
+    runs = text_runs(paragraph)
+    return (''.join(r.text for r in runs), [effective_bold(r) for r in runs for _ in r.text])
+
+
+def compact_snapshot(snapshot):
+    text, mask = snapshot
+    positions = [i for i, char in enumerate(text) if not char.isspace()]
+    value = ''.join(text[i] for i in positions)
+    date_match = re.fullmatch(r'\d{4}年(\d{1,2})月(\d{1,2})日', value)
+    if date_match:
+        drop = {date_match.start(group) for group in (1, 2) if date_match[group].startswith('0')}
+        positions = [p for i, p in enumerate(positions) if i not in drop]
+        value = ''.join(text[i] for i in positions)
+    return value, [mask[i] for i in positions], positions
+
+
+def mapped_bold(snapshot, target):
+    old, weights, _ = compact_snapshot(snapshot)
+    new, _, positions = compact_snapshot((target, [False] * len(target)))
+    result = [False] * len(target)
+    for block in SequenceMatcher(None, old, new, autojunk=False).get_matching_blocks():
+        for i in range(block.size):
+            result[positions[block.b + i]] = weights[block.a + i]
+    return result
+
+
+def furniture(text):
+    text = re.sub(r'\s+', '', text)
+    return text in ('内蒙古准格尔旗', '力量煤业有限公司文件', '〔发文字号待补〕') or bool(re.fullmatch(
+        r'蒙力煤[字号发]*[〔（(]\d{4}[〕）)]\d+号(?:签发人[:：].*)?', text)) or bool(re.match(
+        r'签发人[:：]|(?:主题|抄报|抄送|发文|印发)[:：]', text))
+
+
+def source_bold_map(source, output):
+    """Match source character ranges across reflow and normalized signature dates."""
+    def stream(doc):
+        text, weights, locations = '', [], []
+        for p in doc.paragraphs:
+            if furniture(p.text):
+                continue
+            value, bold, positions = compact_snapshot(bold_snapshot(p))
+            text += value
+            weights.extend(bold)
+            locations.extend((p._p, i) for i in positions)
+        return text, weights, locations
+    old, old_weights, _ = stream(source)
+    new, _, locations = stream(output)
+    maps = {p._p: [False] * len(p.text) for p in output.paragraphs}
+    matched, dropped = set(), []
+    for block in SequenceMatcher(None, old, new, autojunk=False).get_matching_blocks():
+        for i in range(block.size):
+            matched.add(block.a + i)
+            if old_weights[block.a + i]:
+                paragraph, position = locations[block.b + i]
+                maps[paragraph][position] = True
+    for i, weight in enumerate(old_weights):
+        if weight and i not in matched:
+            dropped.append({'source_character': i, 'text': old[max(0, i - 8):i + 9]})
+    return maps, dropped, old == new
+
+
+def tail_layout(doc):
+    """Inspect only the suffix after a dated signature or distribution block."""
+    from docx.text.paragraph import Paragraph
+    nodes = list(doc._element.body)
+    if nodes and nodes[-1].tag == qn('w:sectPr'):
+        nodes.pop()
+    blanks = []
+    while nodes and nodes[-1].tag == qn('w:p'):
+        p = Paragraph(nodes[-1], doc._body)
+        if p.text.strip() or p._p.xpath('.//w:drawing | .//w:pict | .//w:object | .//w:fldChar | .//w:instrText | '
+                                       './/w:bookmarkStart | .//w:bookmarkEnd | .//w:commentRangeStart | '
+                                       './/w:commentRangeEnd | .//w:commentReference | .//w:sdt | .//w:ins | .//w:del'):
+            break
+        blanks.insert(0, nodes.pop())
+    anchor = Paragraph(nodes[-1], doc._body) if nodes and nodes[-1].tag == qn('w:p') else None
+    value = re.sub(r'\s+', '', anchor.text) if anchor else ''
+    applicable = bool(anchor and (re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日', value) or
+                                 re.match(r'(?:发文|印发)[:：]', value)))
+    breaks = []
+    if applicable:
+        for child in reversed(list(anchor._p)):
+            if child.tag != qn('w:r'):
+                break
+            for node in reversed(list(child)):
+                if node.tag == qn('w:rPr'):
+                    continue
+                if node.tag == qn('w:t') and not (node.text or '').strip():
+                    continue
+                if node.tag in (qn('w:br'), qn('w:cr'), qn('w:lastRenderedPageBreak')):
+                    breaks.append(node)
+                    continue
+                return anchor, blanks, breaks, applicable
+    return anchor, blanks, breaks, applicable
+
+
 def spacing_issues(paragraph, *, line_pt=None, single=False):
     attrs = effective_ppr(paragraph, 'spacing')
     issues = {}
@@ -156,14 +279,14 @@ def run_format_issues(run, *, font, size, bold, color=None):
     actual_size = float(effective_run(run, 'sz').get('val', '0')) / 2
     if abs(actual_size - size) > 0.05:
         issues['size_pt'] = actual_size
-    actual_bold = on(effective_run(run, 'b').get('val'))
-    if actual_bold != bold:
+    actual_bold = effective_bold(run)
+    if bold is not None and actual_bold != bold:
         issues['bold'] = actual_bold
     cs_size = effective_run(run, 'szCs').get('val')
     cs_bold = effective_run(run, 'bCs').get('val')
     if cs_size is not None and abs(float(cs_size) / 2 - size) > 0.05:
         issues['complex_size'] = cs_size
-    if cs_bold is not None and on(cs_bold) != bold:
+    if cs_bold is not None and on(cs_bold) != (actual_bold if bold is None else bold):
         issues['complex_bold'] = cs_bold
     if color and effective_run(run, 'color').get('val') != color:
         issues['color'] = effective_run(run, 'color').get('val')

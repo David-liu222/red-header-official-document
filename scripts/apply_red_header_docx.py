@@ -21,7 +21,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Mm, Pt, RGBColor
 
-from red_header_common import attachment_start, closing, independent_heading, safe_blank, spacing_issues, ppr_layers
+from red_header_common import (attachment_start, closing, independent_heading, safe_blank, spacing_issues,
+                               ppr_layers, bold_snapshot, mapped_bold, effective_bold, text_runs, furniture, tail_layout)
 
 
 RED = "FF0000"
@@ -151,6 +152,58 @@ def normalize_blank_separators(doc, signature_start):
         ensure_one_blank_before(signature_start)
 
 
+def restore_source_bold(paragraph, snapshot):
+    """Retain source emphasis by character range after title/date reflow."""
+    from docx.text.run import Run
+    mask = mapped_bold(snapshot, paragraph.text)
+    offset = 0
+    for run in text_runs(paragraph):
+        text = run.text
+        desired = [effective_bold(run) or flag for flag in mask[offset:offset + len(text)]]
+        offset += len(text)
+        if not text or not any(desired):
+            continue
+        groups = []
+        for char, weight in zip(text, desired):
+            if groups and groups[-1][1] == weight:
+                groups[-1][0] += char
+            else:
+                groups.append([char, weight])
+        if len(groups) > 1 and any(child.tag not in (qn('w:rPr'), qn('w:t'), qn('w:br'), qn('w:tab'), qn('w:cr')) for child in run._r):
+            raise ValueError("原稿局部加粗涉及对象/域，须在副本上明确保留范围。")
+        for value, weight in groups:
+            element = deepcopy(run._r)
+            new = Run(element, paragraph)
+            if len(groups) > 1:
+                new.text = value
+            new.bold = weight
+            node = new._r.get_or_add_rPr().find(qn('w:bCs'))
+            if node is None:
+                node = OxmlElement('w:bCs')
+                new._r.rPr.append(node)
+            node.set(qn('w:val'), '1' if weight else '0')
+            run._r.addprevious(element)
+        run._r.getparent().remove(run._r)
+
+
+def trim_post_signature_blank_pages(doc):
+    anchor, blanks, breaks, applicable = tail_layout(doc)
+    if not applicable:
+        return
+    # The first terminal section break describes the preceding real content.
+    # Carry its settings forward instead of inheriting those of an empty section.
+    section = next((n.find(qn('w:pPr')).find(qn('w:sectPr')) for n in blanks
+                    if n.find(qn('w:pPr')) is not None and n.find(qn('w:pPr')).find(qn('w:sectPr')) is not None), None)
+    if section is not None:
+        body = doc._element.body
+        old = body.find(qn('w:sectPr'))
+        if old is not None:
+            body.remove(old)
+        body.append(deepcopy(section))
+    for node in breaks + blanks:
+        node.getparent().remove(node)
+
+
 def enable_title_auto_spacing(paragraph):
     ppr = paragraph._p.get_or_add_pPr()
     for tag in ("autoSpaceDN", "autoSpaceDE"):
@@ -163,7 +216,7 @@ def enable_title_auto_spacing(paragraph):
 
 def format_issuing_number(paragraph, section):
     """Reproduce the approved mixed-font number and wider red rule."""
-    for run in paragraph.runs:
+    for run in text_runs(paragraph):
         set_run(run, font=HEADER_FONT, size=14, bold=False, color="000000")
         fonts = run._r.get_or_add_rPr().rFonts
         for key in ("ascii", "hAnsi", "cs"):
@@ -197,7 +250,7 @@ def distribute_red_header(paragraph):
     ppr = paragraph._p.get_or_add_pPr()
     for element in list(ppr.findall(qn("w:ind"))):
         ppr.remove(element)
-    for run in paragraph.runs:
+    for run in text_runs(paragraph):
         run.text = run.text.replace(" ", "").replace("\u3000", "")
         rpr = run._r.get_or_add_rPr()
         for old in list(rpr.findall(qn("w:spacing"))):
@@ -213,7 +266,7 @@ def set_title_lines(paragraph, lines: list[str]):
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     paragraph.paragraph_format.keep_with_next = True
     paragraph.paragraph_format.keep_together = True
-    for run in paragraph.runs:
+    for run in text_runs(paragraph):
         set_run(run, font=TITLE_FONT, size=22, bold=False)
     set_single_spacing(paragraph)
     clear_title_before_after_spacing(paragraph)
@@ -496,7 +549,7 @@ def normalize_signature(paragraph, section=None, company_text=None):
             ind = paragraph._p.get_or_add_pPr().find(qn('w:ind'))
             ind.set(qn('w:start'), str(round((body_width - 3 - estimated_width) * 20)))
             ind.set(qn('w:end'), '60')
-    for run in paragraph.runs:
+    for run in text_runs(paragraph):
         set_run(run, font=BODY_FONT, size=14, bold=False)
 
 
@@ -533,6 +586,8 @@ def apply(
     title_continuations: list[str] | None = None,
     no_recipient: bool = False,
     body_bold: bool = False,
+    appointment_notice: bool = False,
+    no_title: bool = False,
     title_lines: list[str] | None = None,
     sign_type: str = "external",
     signer: str = "",
@@ -545,6 +600,12 @@ def apply(
     signer_label_tracking_twips: int = SIGNER_LABEL_TRACKING_TWIPS,
     signer_right_indent_pt: float = SIGNER_RIGHT_INDENT_PT,
 ):
+    if appointment_notice and not inspection_material:
+        raise ValueError("任职通知原内容分支仅用于已确认的迎检资料。")
+    if no_title and not appointment_notice:
+        raise ValueError("无正文标题分支须同时声明任职类迎检通知。")
+    if no_title and (title_lines or title_continuations):
+        raise ValueError("原稿无正文标题时不得另行添加标题或标题续行。")
     if blank_document_number and issuing_number.strip() not in ("", "〔发文字号待补〕"):
         raise ValueError("已提供正式文号，不能同时要求正文文号留空。")
     if blank_number_line_pt <= 0:
@@ -556,6 +617,7 @@ def apply(
     if input_path.resolve() == output_path.resolve():
         raise ValueError("禁止覆盖源文件，请使用不同输出目录。")
     doc = Document(str(input_path))
+    source_bolds = {p._p: bold_snapshot(p) for p in doc.paragraphs}
     public_style(doc)
     # Normal must supply inherited zero spacing for titles. It may be repaired
     # globally only when no protected table depends on it; otherwise fail safely.
@@ -571,15 +633,18 @@ def apply(
         raise ValueError("文档没有正文段落，无法安全套用红头。")
 
     original_paragraphs = list(doc.paragraphs)
-    title_paragraph = next((p for p in original_paragraphs if p.text.strip() == title), None)
+    title_paragraph = next((p for p in original_paragraphs if p.text.strip() and not furniture(p.text)), None) if no_title else next((p for p in original_paragraphs if p.text.strip() == title), None)
     if title_paragraph is None:
         raise ValueError(f"未找到标题段落：{title}")
-    title_paragraphs = [title_paragraph]
+    title_paragraphs = [] if no_title else [title_paragraph]
     for continuation in title_continuations or []:
         paragraph = next((p for p in original_paragraphs if p.text.strip() == continuation), None)
         if paragraph is None:
             raise ValueError(f"未找到标题续行段落：{continuation}")
         title_paragraphs.append(paragraph)
+    if title_lines and len(title_paragraphs) > 1:
+        snapshots = [source_bolds[p._p] for p in title_paragraphs]
+        source_bolds[title_paragraph._p] = (''.join(s[0] for s in snapshots), [b for s in snapshots for b in s[1]])
 
     # Replace only recognized leading furniture. Unknown leading content or
     # embedded objects must be handled explicitly, not silently destroyed.
@@ -624,6 +689,7 @@ def apply(
         visible_text = "".join(doc._element.body.xpath('.//w:t/text()'))
         if re.search(r"签\s*发\s*人\s*[:：]|(?:主题|抄报|抄送|发文|印发)\s*[:：]|共印\s*\d+\s*份", visible_text):
             raise ValueError("仍检测到签发/印发栏（可能在表格或文本框中），需人工识别处理后重试。")
+    trim_post_signature_blank_pages(doc)
     # Keep the same wrappers so title/recipient identity comparisons remain
     # valid after cleanup; doc.paragraphs would create new Paragraph wrappers.
     original_paragraphs = [p for p in original_paragraphs if p._p.getparent() is not None]
@@ -671,13 +737,15 @@ def apply(
         reset_indent(paragraph)
         if spacing_issues(paragraph, single=True):
             raise ValueError("标题Normal样式继承的间距不符合0行/单倍要求；不得全局改样式而影响业务表格，请在参考副本中校准。")
-        for run in paragraph.runs:
+        for run in text_runs(paragraph):
             set_run(run, font=TITLE_FONT, size=22, bold=False)
 
     recipient = None if no_recipient else next(
         (p for p in original_paragraphs if p not in title_paragraphs and p.text.strip()),
         None,
     )
+    if appointment_notice and recipient is not None and not recipient.text.strip().endswith(('：', ':')):
+        recipient = None
     company_text = "内蒙古准格尔旗力量煤业有限公司"
     signature_start = next((idx for idx, p in enumerate(original_paragraphs)
                             if p.text.strip() == company_text), None)
@@ -709,9 +777,9 @@ def apply(
         paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
         indent = None if paragraph is recipient else 28
         set_spacing(paragraph, indent_pt=indent)
-        is_heading = independent_heading(text)
+        is_heading = independent_heading(text) and not appointment_notice
         paragraph.paragraph_format.keep_with_next = is_heading
-        for run in paragraph.runs:
+        for run in text_runs(paragraph):
             set_run(run, font=BODY_FONT, size=14, bold=is_heading or body_bold, color="000000")
 
     # Main recipient is top-aligned; keep its text intact and remove accidental leading spaces.
@@ -740,6 +808,10 @@ def apply(
             issue_unit=issue_unit,
             print_count=print_count,
         )
+    trim_post_signature_blank_pages(doc)
+    for paragraph in doc.paragraphs:
+        if paragraph._p in source_bolds:
+            restore_source_bold(paragraph, source_bolds[paragraph._p])
     # Newline formatting in WPS also reads the paragraph marker's rPr.
     for paragraph in doc.paragraphs:
         first = next((r for r in paragraph.runs if r.text.strip()), None)
@@ -765,6 +837,8 @@ def main():
     parser.add_argument("--title-line", action="append", help="输出标题每行文字，按上长下短设置，可重复传入；必须渲染复核")
     parser.add_argument("--no-recipient", action="store_true", help="原稿无主送单位时使用，避免把首段正文误当主送单位")
     parser.add_argument("--body-bold", action="store_true", help="仅用户明确要求普通正文加粗时使用；一级独立小标题默认加粗")
+    parser.add_argument("--appointment-notice", action="store_true", help="任职类迎检通知：按原内容排版，不要求一、序号或新标题")
+    parser.add_argument("--no-title", action="store_true", help="该任职类迎检原稿无正文标题；--title仅用于文件名，不插入正文")
     parser.add_argument("--issuing-number", default="〔发文字号待补〕")
     parser.add_argument("--blank-document-number", action="store_true", help="正文文号行按用户要求留空；文件名仍标注发文字号待补")
     parser.add_argument("--blank-number-line-pt", type=float, default=DEFAULT_NUMBER_LINE_PT,
@@ -794,6 +868,8 @@ def main():
         title_continuations=args.title_continuation,
         no_recipient=args.no_recipient,
         body_bold=args.body_bold,
+        appointment_notice=args.appointment_notice,
+        no_title=args.no_title,
         title_lines=args.title_line,
         sign_type=args.sign_type,
         signer=args.signer,

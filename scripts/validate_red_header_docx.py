@@ -26,7 +26,7 @@ from apply_red_header_docx import (
 )
 from red_header_common import (attachment_start, closing, independent_heading, numbered_level,
                                safe_blank, spacing_issues, indent_issues, run_format_issues,
-                               effective_ppr, on)
+                               effective_ppr, on, source_bold_map, text_runs, effective_bold, tail_layout)
 
 try:
     from docx import Document
@@ -115,6 +115,9 @@ def main():
     parser = argparse.ArgumentParser(description="检查套红头 DOCX 的常见固定规则（只读）")
     parser.add_argument("docx", type=Path)
     parser.add_argument("--title", help="正文标题，用于校验文件名和标题段落")
+    parser.add_argument("--source", type=Path, help="转换后的原稿副本；按文字范围核对原有加粗与任职通知原内容")
+    parser.add_argument("--appointment-notice", action="store_true", help="任职类迎检通知按原内容检查，不强制序号层级或新增标题")
+    parser.add_argument("--no-title", action="store_true", help="原稿无正文标题，--title仅用于核对文件名")
     parser.add_argument("--issuing-number", help="正式文号；省略时读取带红色下边框的文号段落")
     parser.add_argument("--expected-company", default="内蒙古准格尔旗力量煤业有限公司")
     parser.add_argument("--expected-mine", help="需要校验时传入矿名；不传则不强制要求矿名")
@@ -133,16 +136,48 @@ def main():
                         help="按同类型正式样本核验签发栏右缩进，默认68磅")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args()
+    if args.appointment_notice and not args.inspection_material:
+        parser.error('任职通知原内容分支须声明迎检用途')
+    if args.no_title and not args.appointment_notice:
+        parser.error('无正文标题分支须声明任职类迎检通知')
 
     if args.docx.suffix.lower() != ".docx":
         raise SystemExit("只接受 .docx；旧 .doc 请先在副本上转换。")
     doc = Document(str(args.docx))
+    source_masks, dropped_bold, source_content_equal = {}, [], None
+    if args.source:
+        if args.source.suffix.lower() != '.docx':
+            parser.error('原稿须为只读DOCX副本；旧DOC先复制转换')
+        source_masks, dropped_bold, source_content_equal = source_bold_map(Document(args.source), doc)
     checks = []
 
     def add(rule, status, evidence, severity="info"):
         if status == 'review' and severity == 'error':
             status = 'fail'
         checks.append({"rule": rule, "status": status, "evidence": evidence, "severity": severity})
+
+    def run_bold_expectation(paragraph, run, base=False):
+        if base:
+            return True
+        if not args.source:
+            return None
+        offset = 0
+        for candidate in text_runs(paragraph):
+            if candidate._r is run._r:
+                break
+            offset += len(candidate.text)
+        flags = source_masks.get(paragraph._p, [False] * len(paragraph.text))[offset:offset + len(run.text)]
+        visible = [flag for char, flag in zip(run.text, flags) if not char.isspace()]
+        if len(set(visible)) > 1 and effective_bold(run):
+            dropped_bold.append({'text': run.text[:80], 'issue': '原稿局部加粗被扩展到普通文字'})
+        return any(visible)
+
+    def is_title(paragraph):
+        return not args.no_title and args.title and canonical_title(paragraph.text) == canonical_title(args.title)
+
+    if args.no_title:
+        add('任职迎检原稿无标题时不新增正文标题', 'pass' if args.source and source_content_equal else 'manual',
+            '文件名标签不插入正文；原内容一致性另行检查')
 
     for idx, section in enumerate(doc.sections, 1):
         size_ok = abs(mm(section.page_width) - 210) < 0.2 and abs(mm(section.page_height) - 297) < 0.2
@@ -334,7 +369,7 @@ def main():
         add("存在正文段落", "pass", f"共 {len(paragraphs)} 个非空段落")
 
     title_hits = []
-    if args.title:
+    if args.title and not args.no_title:
         title_hits = [(idx, p) for idx, p in paragraphs if canonical_title(p.text) == canonical_title(args.title)]
         add("正文标题与传入标题一致", "pass" if title_hits else "review", [idx for idx, _ in title_hits], "error" if not title_hits else "info")
         expected_name = official_filename(args.title, issuing_number)
@@ -349,7 +384,7 @@ def main():
             for run in paragraph.runs:
                 if not run.text.strip():
                     continue
-                effective_issues = run_format_issues(run, font='黑体', size=22, bold=False)
+                effective_issues = run_format_issues(run, font='黑体', size=22, bold=run_bold_expectation(paragraph, run))
                 if effective_issues:
                     title_issues.append({'paragraph': idx, 'text': run.text[:30], **effective_issues})
                 font_name = east_asia_font(run) or run.font.name
@@ -358,9 +393,7 @@ def main():
                     title_issues.append({"paragraph": idx, "font": font_name, "text": run.text[:20]})
                 if size is not None and abs(size - 22) > 0.5:
                     title_issues.append({"paragraph": idx, "size_pt": size, "text": run.text[:20]})
-                if run.bold is True:
-                    title_issues.append({"paragraph": idx, "bold": True, "text": run.text[:20]})
-        add("标题黑体二号且不加粗", "pass" if title_hits and not title_issues else "review", title_issues[:20] if title_issues else [idx for idx, _ in title_hits], "error" if title_issues else "info")
+        add("标题黑体二号，原有加粗保留", "pass" if title_hits and not title_issues else "review", title_issues[:20] if title_issues else [idx for idx, _ in title_hits], "error" if title_issues else "info")
         title_spacing_issues = []
         for idx, paragraph in title_hits:
             before = pt(paragraph.paragraph_format.space_before)
@@ -397,7 +430,7 @@ def main():
         (
             p
             for idx, p in paragraphs
-            if not (args.title and canonical_title(p.text) == canonical_title(args.title))
+            if not is_title(p)
             and p.text.strip() != issuing_number
             and not is_signer_paragraph(p)
             and not has_paragraph_border(p)
@@ -405,14 +438,20 @@ def main():
         ),
         None,
     )
-    if args.no_recipient:
+    if args.appointment_notice and recipient_paragraph is not None and not recipient_paragraph.text.strip().endswith(('：', ':')):
+        recipient_paragraph = None
+    if args.no_title and args.title:
+        expected_name = official_filename(args.title, issuing_number)
+        add('文件名使用文号与原稿内容标签，不要求正文出现该标签', 'pass' if args.docx.name == expected_name else 'fail',
+            {'filename': args.docx.name, 'expected': expected_name})
+    if args.no_recipient or (args.appointment_notice and recipient_paragraph is None):
         add('原稿无主送分支', 'pass', '已显式传入--no-recipient；首段按正文检查')
     elif recipient_paragraph is None or not recipient_paragraph.text.strip().endswith(('：', ':')):
         add('主送单位可明确识别', 'fail', '首段不是明确的主送段；核对原稿，确无主送时生成与校验均传--no-recipient', 'error')
     body_candidates = [
         (idx, p)
         for idx, p in paragraphs
-        if not (args.title and canonical_title(p.text) == canonical_title(args.title))
+        if not is_title(p)
         and p.text.strip() != issuing_number
         and not is_signer_paragraph(p)
         and not p.text.strip().startswith(circulation_prefixes)
@@ -441,11 +480,12 @@ def main():
         line_pt = pt(pf.line_spacing) if pf.line_spacing_rule == WD_LINE_SPACING.EXACTLY else None
         if line_pt is None or not (25 <= line_pt <= 28 if allow_adjustment else abs(line_pt - 28) < 0.05):
             paragraph_issues.append({"paragraph": idx, "line_spacing_pt": line_pt, "expected": "25—28磅有表格例外" if allow_adjustment else "固定28磅"})
-        for run in paragraph.runs:
+        for run in text_runs(paragraph):
             if not run.text.strip():
                 continue
-            is_heading = independent_heading(paragraph.text)
-            expected_bold = True if paragraph is recipient_paragraph or is_heading else False if paragraph._p in signatures else args.body_bold
+            is_heading = independent_heading(paragraph.text) and not args.appointment_notice
+            base_bold = paragraph is recipient_paragraph or is_heading or (args.body_bold and paragraph._p not in signatures)
+            expected_bold = run_bold_expectation(paragraph, run, base_bold)
             target = recipient_font_issues if paragraph is recipient_paragraph else heading_font_issues if is_heading else font_issues
             issues = run_format_issues(run, font='仿宋', size=14, bold=expected_bold)
             if issues:
@@ -454,21 +494,23 @@ def main():
         if marker:
             bold = marker[0].find(qn('w:b'))
             if bold is not None:
-                expected = paragraph is recipient_paragraph or independent_heading(paragraph.text) or (args.body_bold and paragraph._p not in signatures)
+                first = next((r for r in text_runs(paragraph) if r.text.strip()), None)
+                expected = effective_bold(first) if first is not None else False
                 if on(bold.get(qn('w:val'), '1')) != expected:
                     paragraph_issues.append({'paragraph': idx, 'paragraph_marker_bold': 'conflicts with paragraph role'})
 
-    body_label = "普通正文仿宋四号且按当次要求加粗" if args.body_bold else "普通正文仿宋四号且不加粗"
+    body_label = "普通正文仿宋四号且按当次要求加粗" if args.body_bold else "普通正文仿宋四号，保留原稿加粗"
     add(body_label, "pass" if not font_issues else "review", font_issues[:20], "error" if font_issues else "info")
     add("主送单位仿宋四号且加粗", "pass" if not recipient_font_issues else "review", recipient_font_issues[:20], "error" if recipient_font_issues else "info")
     add('一级独立小标题仿宋四号且加粗', 'fail' if heading_font_issues else 'pass', heading_font_issues,
         'error' if heading_font_issues else 'info')
     add("正文段前段后为0、默认固定28磅（有表格局部压缩须显式声明）", "pass" if not paragraph_issues else "review", paragraph_issues[:20], "error" if paragraph_issues else "info")
-    add("正文条目不以分号结尾", "pass" if not semicolon_hits else "review", semicolon_hits, "error" if semicolon_hits else "info")
+    add("正文条目末尾标点", "pass" if not semicolon_hits else "review", semicolon_hits,
+        "error" if semicolon_hits and not args.appointment_notice else "info")
 
     full_text = "\n".join(p.text for _, p in paragraphs)
     book_hits = [{'paragraph': idx, 'text': p.text[:120]} for idx, p in paragraphs if re.search(r'》\s*、\s*《', p.text)]
-    add('相邻书名号之间无顿号', 'fail' if book_hits else 'pass', book_hits, 'error' if book_hits else 'info')
+    add('相邻书名号之间无顿号', 'review' if book_hits else 'pass', book_hits, 'error' if book_hits and not args.appointment_notice else 'info')
     hierarchy_issues, punctuation_issues, previous_level, in_attachments = [], [], None, False
     for idx, p in body_candidates:
         text = p.text.strip()
@@ -485,17 +527,19 @@ def main():
         in_attachments = False
         level = numbered_level(text)
         if level is not None:
-            if (previous_level is None and level > 1) or (previous_level is not None and level > previous_level + 1):
+            if not args.appointment_notice and ((previous_level is None and level > 1) or (previous_level is not None and level > previous_level + 1)):
                 hierarchy_issues.append({'paragraph': idx, 'text': text[:80], 'previous_level': previous_level, 'level': level})
             previous_level = level
-            if not independent_heading(text) and not text.endswith(('。', '：', ':')):
+            if not args.appointment_notice and not independent_heading(text) and not text.endswith(('。', '：', ':')):
                 punctuation_issues.append({'paragraph': idx, 'text': text[-100:], 'expected': '完整条目以。结束；冒号引出内容和独立小标题除外'})
     add('显式序号层级无跳级', 'fail' if hierarchy_issues else 'pass', hierarchy_issues, 'error' if hierarchy_issues else 'info')
     add('完整序号条目用句号结束', 'fail' if punctuation_issues else 'pass', punctuation_issues, 'error' if punctuation_issues else 'info')
     if any(p._p.xpath('./w:pPr/w:numPr[not(w:numId/@w:val="0")]') for _, p in paragraphs):
         add('自动编号的实际显示层级与序号', 'manual', 'XML自动编号需结合numbering.xml与实际页面核对，未按纯文本规则假定通过')
     closing_issues = [{'paragraph': idx, 'text': p.text} for idx, p in paragraphs if closing(p.text) and p.text.strip()[-1] in '。.;；！!？?']
-    add('已识别结束语不带结束标点', 'fail' if closing_issues else 'pass', closing_issues, 'error' if closing_issues else 'info')
+    add('已识别结束语不带结束标点（任职迎检按原稿保留）',
+        'review' if closing_issues and args.appointment_notice else 'fail' if closing_issues else 'pass',
+        closing_issues, 'error' if closing_issues and not args.appointment_notice else 'info')
     separator_issues, protected_separators = [], []
     all_p = list(doc.paragraphs)
     for i, p in enumerate(all_p):
@@ -556,8 +600,29 @@ def main():
         "error" if border_issues else "info",
     )
 
-    if not args.title:
-        add("标题黑体二号且不加粗", "manual", "请传入 --title 后自动检查标题段落")
+    if args.source:
+        for p in doc.paragraphs:
+            offset = 0
+            for run in text_runs(p):
+                flags = source_masks[p._p][offset:offset + len(run.text)]
+                if any(flags) and not effective_bold(run):
+                    dropped_bold.append({'text': run.text[:80], 'issue': '原稿加粗被清除'})
+                offset += len(run.text)
+        add('原稿加粗文字范围保留', 'fail' if dropped_bold else 'pass', dropped_bold, 'error' if dropped_bold else 'info')
+    else:
+        add('原稿加粗文字范围保留', 'manual', '传入--source原稿副本或逐项人工对照；普通正文加粗不自动判为错误')
+    if args.appointment_notice:
+        add('任职迎检通知原内容未增写标题、序号或改写条目',
+            'manual' if not args.source else 'pass' if source_content_equal else 'fail',
+            {'source_provided': bool(args.source), 'content_equal': source_content_equal},
+            'error' if args.source and not source_content_equal else 'info')
+    _, trailing_blanks, trailing_breaks, tail_applicable = tail_layout(doc)
+    tail_issues = {'trailing_empty_paragraphs': len(trailing_blanks), 'trailing_breaks': len(trailing_breaks)} if tail_applicable else {}
+    tail_bad = tail_applicable and bool(trailing_blanks or trailing_breaks)
+    add('落款后无可安全识别的空段及末尾分页', 'fail' if tail_bad else 'pass', tail_issues, 'error' if tail_bad else 'info')
+    add('落款后无多余空白页', 'manual', '逐页渲染至最后一页；仅有页码/页眉的页面仍为空白页，保留真实附件和业务内容')
+    if not args.title and not args.no_title:
+        add("标题黑体二号，原有加粗保留", "manual", "请传入 --title 后自动检查标题段落")
     add("红头颜色、红线、右下角落款、页码和上长下短", "manual", "需渲染页面图片或用目标办公软件目测确认")
     add("公司落款靠近版心右边界，矿名和日期以公司为基准居中", "manual", "核对公司名称实际字宽；不得仅凭固定220磅左缩进或与旧版相比平移5毫米验收")
     add('序号语义、附件范围及未知结束语', 'manual', '机械规则已独立检查；完整词语、条目是否完整与附件业务范围仍需逐页确认')

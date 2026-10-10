@@ -85,6 +85,19 @@ def main() -> int:
         notes.append("迎检内发文：生成和校验均须传 --inspection-material；无签发人/印发栏，不要求抄送及印数")
         if sign_type == "external":
             warnings.append("迎检标记与外发选择冲突：须确认文件类型，不静默当作普通内发文")
+    appointment = payload.get('appointmentNotice', red.get('appointment_notice', False))
+    no_title = payload.get('noTitle', red.get('no_title', False))
+    for name, flag in [('appointmentNotice', appointment), ('noTitle', no_title)]:
+        if not isinstance(flag, bool):
+            errors.append(f'{name} 必须为 JSON 布尔值')
+    if appointment is True:
+        if not inspection:
+            errors.append('任职通知原内容分支须先确认迎检用途')
+        notes.append('任职迎检通知保留原内容和原有加粗，不强制一、序号或新增标题；校验传 --source 原稿副本')
+    if no_title is True:
+        if appointment is not True:
+            errors.append('noTitle 只用于任职类迎检原稿无标题分支')
+        notes.append('原稿无正文标题：--title仅作文件名标签；生成和校验均传 --no-title')
     output_mode = value(payload, "outputMode") or value(red, "output_mode") or "docxOnly"
     if output_mode == "docxPdf":
         warnings.append("输出模式 docxPdf 已废弃：按 docxOnly 执行，不产出 PDF")
@@ -110,6 +123,8 @@ def main() -> int:
         "source_file_count": len(source_files),
         "sign_type": sign_type,
         "inspection_material": inspection,
+        "appointment_notice": appointment,
+        "no_title": no_title,
         "output_mode": output_mode,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))

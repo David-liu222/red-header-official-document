@@ -15,6 +15,7 @@ from docx.oxml.ns import qn
 from apply_red_header_docx import apply, set_paragraph_border
 from extract_review_comments import extract
 from validate_outputs import visible_files
+from red_header_common import bold_snapshot, compact_snapshot, effective_bold, text_runs
 
 
 TITLE = "关于测试事项的通知"
@@ -293,7 +294,7 @@ class HeaderRulesTest(unittest.TestCase):
         self.assertIn('特此通知。', [p.text for p in Document(output).paragraphs])
         code, report = self.validate(output)
         self.assertEqual(code, 1)
-        self.assertTrue(any(c['rule'] == '已识别结束语不带结束标点' for c in self.failures(report)))
+        self.assertTrue(any(c['rule'].startswith('已识别结束语不带结束标点') for c in self.failures(report)))
 
     def test_inherited_header_indent_is_detected(self):
         output = self.apply_custom(self.custom_source())
@@ -336,7 +337,7 @@ class HeaderRulesTest(unittest.TestCase):
         self.assertIs(paragraph.runs[0].bold, False)
         code, report = self.validate(output)
         self.assertEqual(code, 1)
-        self.assertTrue(any(c['rule'] == '普通正文仿宋四号且不加粗' for c in self.failures(report)))
+        self.assertTrue(any(c['rule'] == '普通正文仿宋四号，保留原稿加粗' for c in self.failures(report)))
 
     def test_lowercase_complex_script_theme_is_detected(self):
         output = self.apply_custom(self.custom_source())
@@ -474,6 +475,246 @@ class HeaderRulesTest(unittest.TestCase):
         self.assertTrue(report['summary']['automatic_ok'])
         self.assertFalse(report['summary']['formal_ready'])
         self.assertGreater(report['summary']['pending_manual'], 0)
+
+    def test_partial_source_bold_remains_partial(self):
+        source = self.custom_source(body=['本条按原内容办理。'])
+        doc = Document(source)
+        p = doc.paragraphs[2]
+        p.clear()
+        p.add_run('本条').bold = True
+        p.add_run('按原内容办理。').bold = False
+        doc.add_comment(p.runs[0], text='原有强调', author='测试审阅人')
+        doc.save(source)
+        before = source.read_bytes()
+        output = self.apply_custom(source)
+        body = next(p for p in Document(output).paragraphs if p.text == '本条按原内容办理。')
+        self.assertEqual(bold_snapshot(body)[1], [True, True] + [False] * len('按原内容办理。'))
+        self.assertEqual(extract(output)['comments'][0]['anchors'][0]['selected_text'], '本条')
+        self.assertEqual(before, source.read_bytes())
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_source_style_bold_is_materialized(self):
+        from docx.enum.style import WD_STYLE_TYPE
+        source = self.custom_source(body=['原样保留本条。'])
+        doc = Document(source)
+        style = doc.styles.add_style('测试原稿强调', WD_STYLE_TYPE.PARAGRAPH)
+        style.font.bold = True
+        doc.paragraphs[2].style = style
+        self.assertIsNone(doc.paragraphs[2].runs[0].bold)
+        doc.save(source)
+        output = self.apply_custom(source)
+        body = next(p for p in Document(output).paragraphs if p.text == '原样保留本条。')
+        self.assertTrue(all(r.bold for r in body.runs))
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_style_bold_toggles_are_not_mistaken_for_source_bold(self):
+        from docx.enum.style import WD_STYLE_TYPE
+        source = self.custom_source(body=['原样保留本条。'])
+        doc = Document(source)
+        ps = doc.styles.add_style('测试段落强调', WD_STYLE_TYPE.PARAGRAPH)
+        ps.font.bold = True
+        rs = doc.styles.add_style('测试字符切换', WD_STYLE_TYPE.CHARACTER)
+        rs.font.bold = True
+        doc.paragraphs[2].style = ps
+        doc.paragraphs[2].runs[0].style = rs
+        self.assertFalse(effective_bold(doc.paragraphs[2].runs[0]))
+        doc.save(source)
+        output = self.apply_custom(source)
+        body = next(p for p in Document(output).paragraphs if p.text == '原样保留本条。')
+        self.assertFalse(effective_bold(body.runs[0]))
+
+    def test_title_reflow_preserves_partial_source_bold(self):
+        source = self.custom_source()
+        doc = Document(source)
+        p = doc.paragraphs[0]
+        p.clear()
+        p.add_run('关于').bold = False
+        p.add_run('测试事项').bold = True
+        p.add_run('的通知').bold = False
+        doc.save(source)
+        output = self.apply_custom(source, title_lines=['关于测试事项', '的通知'])
+        p = next(p for p in Document(output).paragraphs if p.text.replace('\n', '') == TITLE)
+        value, weights, _ = compact_snapshot(bold_snapshot(p))
+        self.assertEqual(value, TITLE)
+        self.assertEqual(weights, [False] * 2 + [True] * 4 + [False] * 3)
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_signature_date_normalization_preserves_emphasis(self):
+        source = self.custom_source()
+        doc = Document(source)
+        doc.paragraphs[-1].runs[0].text = '2026 年 09 月 01 日'
+        doc.paragraphs[-1].runs[0].bold = True
+        doc.save(source)
+        output = self.apply_custom(source)
+        p = next(p for p in Document(output).paragraphs if p.text == '2026年9月1日')
+        self.assertTrue(all(effective_bold(r) for r in p.runs if r.text.strip()))
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_validator_detects_erased_source_bold(self):
+        source = self.custom_source(body=['本条继续保留。'])
+        doc = Document(source)
+        doc.paragraphs[2].runs[0].bold = True
+        doc.save(source)
+        output = self.apply_custom(source)
+        doc = Document(output)
+        p = next(p for p in doc.paragraphs if p.text == '本条继续保留。')
+        for r in p.runs:
+            r.bold = False
+            r._r.rPr.find(qn('w:bCs')).set(qn('w:val'), '0')
+        doc.save(output)
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 1)
+        self.assertTrue(any(c['rule'] == '原稿加粗文字范围保留' for c in self.failures(report)))
+
+    def test_validator_detects_extended_partial_source_bold(self):
+        source = self.custom_source(body=['本条继续保留。'])
+        doc = Document(source)
+        p = doc.paragraphs[2]
+        p.clear()
+        p.add_run('本条').bold = True
+        p.add_run('继续保留。').bold = False
+        doc.save(source)
+        output = self.apply_custom(source)
+        doc = Document(output)
+        p = next(p for p in doc.paragraphs if p.text == '本条继续保留。')
+        for r in p.runs:
+            r.bold = True
+            r._r.rPr.find(qn('w:bCs')).set(qn('w:val'), '1')
+        doc.save(output)
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 1)
+
+    def test_trailing_empty_paragraphs_and_page_breaks_are_removed(self):
+        source = self.custom_source()
+        doc = Document(source)
+        doc.paragraphs[-1].runs[0].add_break(__import__('docx.enum.text', fromlist=['WD_BREAK']).WD_BREAK.PAGE)
+        for _ in range(30):
+            doc.add_paragraph()
+        doc.add_page_break()
+        doc.save(source)
+        before = source.read_bytes()
+        output = self.apply_custom(source)
+        doc = Document(output)
+        self.assertEqual(doc.paragraphs[-1].text, '2026年9月1日')
+        self.assertFalse(doc.paragraphs[-1]._p.xpath('.//w:br'))
+        self.assertEqual(before, source.read_bytes())
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_empty_final_section_keeps_real_content_section_settings(self):
+        from docx.enum.section import WD_SECTION
+        from docx.shared import Mm
+        source = self.custom_source()
+        doc = Document(source)
+        doc.sections[-1].right_margin = Mm(23)
+        doc.add_section(WD_SECTION.ODD_PAGE).right_margin = Mm(40)
+        doc.add_paragraph()
+        doc.save(source)
+        output = self.apply_custom(source)
+        doc = Document(output)
+        self.assertEqual(len(doc.sections), 1)
+        self.assertLess(abs(doc.sections[0].right_margin - Mm(23)), Mm(0.01))
+        self.assertEqual(doc.paragraphs[-1].text, '2026年9月1日')
+
+    def test_real_attachment_after_signature_is_not_deleted(self):
+        source = self.custom_source()
+        doc = Document(source)
+        p = doc.add_paragraph('附件：另附业务材料。')
+        p.runs[0].bold = True
+        doc.add_paragraph('原附件内容继续保留。')
+        doc.save(source)
+        output = self.apply_custom(source)
+        texts = [p.text for p in Document(output).paragraphs]
+        self.assertIn('附件：另附业务材料。', texts)
+        self.assertEqual(texts[-1], '原附件内容继续保留。')
+
+    def test_validator_rejects_trailing_blank_suffix(self):
+        output = self.apply_custom(self.custom_source())
+        doc = Document(output)
+        doc.add_page_break()
+        doc.save(output)
+        code, report = self.validate(output)
+        self.assertEqual(code, 1)
+        self.assertTrue(any(c['rule'] == '落款后无可安全识别的空段及末尾分页' for c in self.failures(report)))
+
+    def test_appointment_notice_keeps_original_arabic_items(self):
+        source = self.custom_source(body=['1.按原内容办理。', '2.原有职责继续保留。'])
+        output = self.apply_custom(source, inspection_material=True, appointment_notice=True)
+        doc = Document(output)
+        texts = [p.text for p in doc.paragraphs]
+        self.assertIn('1.按原内容办理。', texts)
+        self.assertFalse(any(p.text.startswith('一、') for p in doc.paragraphs))
+        code, report = self.validate(output, '--source', str(source), '--inspection-material', '--appointment-notice')
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_titleless_appointment_notice_adds_no_title(self):
+        source = self.custom_source(body=['1.按原内容办理。'], no_recipient=True)
+        doc = Document(source)
+        doc.paragraphs[0]._p.getparent().remove(doc.paragraphs[0]._p)
+        doc.save(source)
+        output = self.apply_custom(source, inspection_material=True, appointment_notice=True, no_title=True)
+        doc = Document(output)
+        self.assertFalse(any(p.text == TITLE for p in doc.paragraphs))
+        self.assertIn('1.按原内容办理。', [p.text for p in doc.paragraphs])
+        code, report = self.validate(output, '--source', str(source), '--inspection-material', '--appointment-notice', '--no-title')
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_appointment_notice_keeps_original_punctuation(self):
+        body = ['1.按原内容办理；', '2.参照《示例规范甲》、《示例规范乙》。', '特此通知。']
+        source = self.custom_source(body=body)
+        output = self.apply_custom(source, inspection_material=True, appointment_notice=True)
+        texts = [p.text for p in Document(output).paragraphs]
+        self.assertTrue(all(text in texts for text in body))
+        code, report = self.validate(output, '--source', str(source), '--inspection-material', '--appointment-notice')
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_appointment_notice_does_not_force_heading_bold(self):
+        source = self.custom_source(body=['一、原有独立说明', '原有内容继续保留。'])
+        output = self.apply_custom(source, inspection_material=True, appointment_notice=True)
+        heading = next(p for p in Document(output).paragraphs if p.text == '一、原有独立说明')
+        self.assertFalse(any(effective_bold(r) for r in heading.runs))
+        code, report = self.validate(output, '--source', str(source), '--inspection-material', '--appointment-notice')
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_appointment_validator_detects_invented_heading(self):
+        source = self.custom_source(body=['按原内容办理。'])
+        output = self.apply_custom(source, inspection_material=True, appointment_notice=True)
+        doc = Document(output)
+        next(p for p in doc.paragraphs if p.text == '按原内容办理。').runs[0].text = '一、按原内容办理。'
+        doc.save(output)
+        code, report = self.validate(output, '--source', str(source), '--inspection-material', '--appointment-notice')
+        self.assertEqual(code, 1)
+        self.assertTrue(any(c['rule'] == '任职迎检通知原内容未增写标题、序号或改写条目' for c in self.failures(report)))
+
+    def test_appointment_mode_requires_inspection_scope(self):
+        with self.assertRaisesRegex(ValueError, '仅用于已确认的迎检资料'):
+            self.apply_custom(self.custom_source(), appointment_notice=True)
+        with self.assertRaisesRegex(ValueError, '须同时声明任职类迎检通知'):
+            self.apply_custom(self.custom_source(), no_title=True)
+
+    def test_web_contract_keeps_appointment_and_no_title_scope(self):
+        path = self.root / 'task.json'
+        task = {'task_type': 'office_red_head_document', 'skill_name': 'red-header-official-document',
+                'output_folder': str(self.root / 'output'), 'payload': {'body': '按原内容办理。',
+                'title': '原稿内容标签', 'inspectionMaterial': True, 'appointmentNotice': True, 'noTitle': True}}
+        script = str(Path(__file__).with_name('validate_task.py'))
+        for inspection, expected in [(True, 0), (False, 1)]:
+            task['payload']['inspectionMaterial'] = inspection
+            path.write_text(json.dumps(task, ensure_ascii=False))
+            result = subprocess.run([sys.executable, script, str(path)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected)
+            report = json.loads(result.stdout)
+            self.assertIs(report['appointment_notice'], True)
+            self.assertIs(report['no_title'], True)
+        task['payload']['inspectionMaterial'] = True
+        task['payload']['noTitle'] = 'true'
+        path.write_text(json.dumps(task, ensure_ascii=False))
+        result = subprocess.run([sys.executable, script, str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
 
     def test_hidden_work_and_wps_lock_files_are_not_deliverables(self):
         folder = self.root / 'delivery'; folder.mkdir()
