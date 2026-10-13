@@ -582,7 +582,7 @@ def apply(
     output_path: Path,
     *,
     title: str,
-    issuing_number: str,
+    issuing_number: str | None = None,
     title_continuations: list[str] | None = None,
     no_recipient: bool = False,
     body_bold: bool = False,
@@ -606,17 +606,25 @@ def apply(
         raise ValueError("无正文标题分支须同时声明任职类迎检通知。")
     if no_title and (title_lines or title_continuations):
         raise ValueError("原稿无正文标题时不得另行添加标题或标题续行。")
-    if blank_document_number and issuing_number.strip() not in ("", "〔发文字号待补〕"):
+    if blank_document_number and (issuing_number or '').strip() not in ("", "〔发文字号待补〕"):
         raise ValueError("已提供正式文号，不能同时要求正文文号留空。")
     if blank_number_line_pt <= 0:
         raise ValueError("空文号段行距必须大于0。")
     if signer_label_tracking_twips < 0 or signer_right_indent_pt < 0:
         raise ValueError("签发栏字距和右缩进不得为负数。")
+    doc = Document(str(input_path))
+    if not issuing_number:
+        existing_numbers = [] if blank_document_number else list(dict.fromkeys(
+            re.sub(r'\s+', '', p.text) for p in doc.paragraphs
+            if re.fullmatch(r'蒙力煤[字号发]*[〔（(]\d{4}[〕）)]\d+号', re.sub(r'\s+', '', p.text))
+        ))
+        if len(existing_numbers) > 1:
+            raise ValueError('原稿存在多个不同文号，须明确传入--issuing-number，不自动选取。')
+        issuing_number = existing_numbers[0] if existing_numbers else '〔发文字号待补〕'
     full_title = canonical_title(title + "".join(title_continuations or []))
     output_path = output_path.with_name(official_filename(full_title, issuing_number))
     if input_path.resolve() == output_path.resolve():
         raise ValueError("禁止覆盖源文件，请使用不同输出目录。")
-    doc = Document(str(input_path))
     source_bolds = {p._p: bold_snapshot(p) for p in doc.paragraphs}
     public_style(doc)
     # Normal must supply inherited zero spacing for titles. It may be repaired
@@ -839,7 +847,7 @@ def main():
     parser.add_argument("--body-bold", action="store_true", help="仅用户明确要求普通正文加粗时使用；一级独立小标题默认加粗")
     parser.add_argument("--appointment-notice", action="store_true", help="任职类迎检通知：按原内容排版，不要求一、序号或新标题")
     parser.add_argument("--no-title", action="store_true", help="该任职类迎检原稿无正文标题；--title仅用于文件名，不插入正文")
-    parser.add_argument("--issuing-number", default="〔发文字号待补〕")
+    parser.add_argument("--issuing-number", help="已确认文号优先；省略时读取原稿唯一文号，无文号时标待补，多文号时停止")
     parser.add_argument("--blank-document-number", action="store_true", help="正文文号行按用户要求留空；文件名仍标注发文字号待补")
     parser.add_argument("--blank-number-line-pt", type=float, default=DEFAULT_NUMBER_LINE_PT,
                         help="空文号段行距，默认27磅；本次2023内发样本使用19磅")

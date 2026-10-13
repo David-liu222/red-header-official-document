@@ -66,7 +66,7 @@ def main() -> int:
     if not fields["主送单位"]:
         warnings.append("主送单位缺失：不得凭空判断内外发")
     if not fields["发文字号"]:
-        warnings.append("发文字号缺失：只能生成待补文号审阅稿")
+        warnings.append("发文字号字段未填写：先核查原稿已有文号；唯一且无冲突时沿用，原稿无文号且没有用户确认时才生成待补文号审阅稿")
     if not fields["落款单位"]:
         warnings.append("落款单位缺失：可按红头单位临时处理并列为待确认")
     if not fields["成文日期"]:

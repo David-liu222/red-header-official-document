@@ -2,7 +2,7 @@
 name: red-header-official-document
 description: 按已确认的中国企业红头公文规范生成、改写和复核 Word/DOCX 公文，处理红头、发文字号、标题、正文、层级序号、主送单位、附件、落款、日期、文件命名和渲染验收。Use when 用户要求“套红头”“红头文件”“公文格式”、提供红头公文样例或规则截图，或需要把请示、报告、通知等文稿排成指定格式。
 metadata:
-  version: "2026.10.10"
+  version: "2026.10.13"
 ---
 
 # 套红头公文
@@ -24,6 +24,8 @@ metadata:
 原文件中已加粗的文字继续保留，按原有文字范围执行，包含局部加粗和样式继承的加粗；不得套用默认格式时统一清除或扩大到整段。原稿未加粗的文字再按对应区域默认规则处理。
 
 任职类通知的迎检文件按原有内容直接生成：保留原有标题、段落、人员任职文字和序号，不为满足通用层级规则补写“一、”、分节标题或正文标题；原稿没有标题时也不另造标题。落款后不得留下多余空白页，清理后必须逐页核对至最后一页。
+
+文号先按用户明确指定值处理；用户未另指定时核查原稿已有文号，不把网页字段留空误当作原稿无文号。生成器未传`--issuing-number`时读取原稿唯一文号；多个不同文号须明确，原稿确无文号才标待补。文件名必须包含正文文号，即使没有正文标题也使用原文件名称或已核实内容标签。主送和普通正文默认左对齐，任职条目不得整段居中；公司、矿名和日期共用居中区域，无定位空格/制表位和首行/悬挂字符缩进。实际显示仍须逐页验收。
 
 详细固定规则、冲突边界和待补充项见 [references/rules-and-open-questions.md](references/rules-and-open-questions.md)。
 
@@ -72,7 +74,7 @@ metadata:
 网页办公助手会传入 `task_type=office_red_head_document`、`skill_name=red-header-official-document`。必须按以下约定处理：
 
 - `payload.title`：文件标题；缺失时从上传原稿或正文首个标题段识别，不能识别则在验收报告列为待确认。
-- `payload.documentNo` / `red_head_document.document_no`：发文字号；缺失时只能生成“待补文号审阅稿”。
+- `payload.documentNo` / `red_head_document.document_no`：发文字号；字段未填写时先核查原稿，原稿唯一文号且无用户覆盖/冲突时沿用，确无文号才生成“待补文号审阅稿”。
 - `payload.recipient` / `red_head_document.recipient`：主送单位；缺失时不得凭空推断。
 - `payload.companyName` / `red_head_document.company_name`：红头单位，默认 `内蒙古准格尔旗力量煤业有限公司`。
 - `payload.issueUnit` / `red_head_document.issue_unit`：落款单位；缺失时按红头单位临时处理并列为待确认。

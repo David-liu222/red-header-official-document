@@ -727,5 +727,119 @@ class HeaderRulesTest(unittest.TestCase):
         self.assertEqual([p.name for p in visible_files(folder)], ['deliverable.docx'])
 
 
+    def test_existing_source_number_is_used_when_argument_is_omitted(self):
+        source = self.source(decorated=True)
+        original = source.read_bytes()
+        output = apply(source, self.root / 'auto/out.docx', title=TITLE, sign_type='internal', inspection_material=True)
+        self.assertEqual(output.name, NUMBER + '：' + TITLE + '.docx')
+        self.assertEqual(Document(output).paragraphs[2].text, NUMBER)
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_confirmed_number_overrides_existing_source_number(self):
+        number = '蒙力煤字〔2026〕2号'
+        output = apply(self.source(decorated=True), self.root / 'override/out.docx', title=TITLE,
+                       issuing_number=number, inspection_material=True)
+        self.assertEqual(output.name, number + '：' + TITLE + '.docx')
+        self.assertNotIn(NUMBER, [p.text for p in Document(output).paragraphs])
+
+    def test_ambiguous_source_numbers_are_not_chosen_automatically(self):
+        source = self.source(decorated=True)
+        doc = Document(source)
+        doc.paragraphs[2].insert_paragraph_before('蒙力煤字〔2026〕2号')
+        doc.save(source)
+        with self.assertRaisesRegex(ValueError, '多个不同文号'):
+            apply(source, self.root / 'ambiguous/out.docx', title=TITLE, inspection_material=True)
+        self.assertFalse((self.root / 'ambiguous').exists())
+
+    def test_missing_source_number_stays_pending(self):
+        output = apply(self.source(), self.root / 'pending/out.docx', title=TITLE)
+        self.assertTrue(output.name.startswith('〔发文字号待补〕：'))
+        self.assertEqual(Document(output).paragraphs[2].text, '〔发文字号待补〕')
+
+    def test_explicit_blank_number_does_not_reuse_source_number(self):
+        output = apply(self.source(decorated=True), self.root / 'blank/out.docx', title=TITLE,
+                       inspection_material=True, blank_document_number=True)
+        self.assertTrue(output.name.startswith('〔发文字号待补〕：'))
+        self.assertEqual(Document(output).paragraphs[2].text, '')
+
+    def test_centered_body_is_detected_directly_and_through_style(self):
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited):
+                output = self.apply_custom(self.custom_source(body=['1.按原内容办理。']),
+                                           inspection_material=True, appointment_notice=True)
+                doc = Document(output)
+                p = next(p for p in doc.paragraphs if p.text.startswith('1.'))
+                p.alignment = None if inherited else WD_ALIGN_PARAGRAPH.CENTER
+                if inherited:
+                    p.style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                doc.save(output)
+                code, report = self.validate(output, '--inspection-material', '--appointment-notice')
+                self.assertEqual(code, 1)
+                self.assertTrue(any(c['rule'] == '主送及普通正文左对齐，任职条目不居中' for c in self.failures(report)))
+
+    def source_with_mine(self):
+        source = self.custom_source()
+        doc = Document(source)
+        doc.paragraphs[-1].insert_paragraph_before('大饭铺煤矿')
+        doc.save(source)
+        return source
+
+    def test_mine_must_share_signature_alignment_region(self):
+        for wrong_alignment in (True, False):
+            with self.subTest(wrong_alignment=wrong_alignment):
+                output = self.apply_custom(self.source_with_mine())
+                doc = Document(output)
+                p = next(p for p in doc.paragraphs if p.text == '大饭铺煤矿')
+                if wrong_alignment:
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                else:
+                    p.paragraph_format.left_indent = Pt(0)
+                    p._p.pPr.find(qn('w:ind')).set(qn('w:start'), '0')
+                doc.save(output)
+                code, report = self.validate(output)
+                self.assertEqual(code, 1)
+                self.assertTrue(any(c['rule'] == '公司落款、矿名与日期在同一对齐区域居中' for c in self.failures(report)))
+
+    def test_signature_first_line_character_indent_is_detected(self):
+        output = self.apply_custom(self.custom_source())
+        doc = Document(output)
+        p = doc.paragraphs[-1]
+        p._p.pPr.find(qn('w:ind')).set(qn('w:firstLineChars'), '2100')
+        doc.save(output)
+        code, report = self.validate(output)
+        self.assertEqual(code, 1)
+        self.assertTrue(any(c['rule'].startswith('落款无首行/悬挂字符缩进') for c in self.failures(report)))
+
+    def test_signature_padding_and_tabs_are_detected(self):
+        for padding in (' ' * 12, '\t'):
+            with self.subTest(padding=repr(padding)):
+                output = self.apply_custom(self.source_with_mine())
+                doc = Document(output)
+                p = next(p for p in doc.paragraphs if p.text == '大饭铺煤矿')
+                p.runs[0].text = padding + p.runs[0].text
+                doc.save(output)
+                code, report = self.validate(output)
+                self.assertEqual(code, 1)
+                self.assertTrue(any(c['rule'].startswith('落款无首行/悬挂字符缩进') for c in self.failures(report)))
+
+    def test_filename_number_is_checked_without_title_argument(self):
+        source = self.custom_source(body=['按原内容办理。'], no_recipient=True)
+        doc = Document(source)
+        doc.paragraphs[0]._p.getparent().remove(doc.paragraphs[0]._p)
+        doc.save(source)
+        output = self.apply_custom(source, inspection_material=True, appointment_notice=True, no_title=True)
+        command = [sys.executable, str(Path(__file__).with_name('validate_red_header_docx.py')),
+                   str(output), '--inspection-material', '--appointment-notice', '--no-title', '--no-recipient', '--json']
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        wrong = output.with_name('原稿内容标签.docx')
+        output.rename(wrong)
+        command[2] = str(wrong)
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(any(c['rule'] == '未传标题时文件名仍须包含正文文号及标题标签'
+                            for c in self.failures(json.loads(result.stdout))))
+
+
 if __name__ == "__main__":
     unittest.main()

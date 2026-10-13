@@ -244,6 +244,11 @@ def main():
     ))
     number_paragraphs = ([p for _, p in paragraphs if p.text.strip() == issuing_number]
                          if issuing_number else [])
+    if not args.title:
+        filename_number = issuing_number or '〔发文字号待补〕'
+        filename_ok = args.docx.name.startswith(filename_number + '：') and bool(args.docx.stem[len(filename_number) + 1:].strip())
+        add('未传标题时文件名仍须包含正文文号及标题标签', 'pass' if filename_ok else 'fail',
+            {'filename': args.docx.name, 'required_prefix': filename_number + '：'}, 'info' if filename_ok else 'error')
     if args.blank_document_number:
         blank_number = doc.paragraphs[2] if len(doc.paragraphs) > 2 else None
         blank_number_ok = bool(
@@ -460,6 +465,7 @@ def main():
     recipient_font_issues = []
     heading_font_issues = []
     paragraph_issues = []
+    alignment_issues = []
     semicolon_hits = []
     signatures = {p._p for _, p in paragraphs if p.text.strip() in (args.expected_company, args.expected_mine, '大饭铺煤矿')
                   or re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日', p.text.strip())}
@@ -470,6 +476,9 @@ def main():
         if paragraph.text.rstrip().endswith("；"):
             semicolon_hits.append(idx)
         pf = paragraph.paragraph_format
+        alignment = effective_ppr(paragraph, 'jc').get('val', 'left')
+        if paragraph._p not in signatures and alignment not in ('left', 'start'):
+            alignment_issues.append({'paragraph': idx, 'text': paragraph.text[:80], 'effective_alignment': alignment})
         spacing_problem = spacing_issues(paragraph)
         if on(effective_ppr(paragraph, 'snapToGrid').get('val')):
             spacing_problem['snapToGrid'] = 'enabled'
@@ -505,6 +514,8 @@ def main():
     add('一级独立小标题仿宋四号且加粗', 'fail' if heading_font_issues else 'pass', heading_font_issues,
         'error' if heading_font_issues else 'info')
     add("正文段前段后为0、默认固定28磅（有表格局部压缩须显式声明）", "pass" if not paragraph_issues else "review", paragraph_issues[:20], "error" if paragraph_issues else "info")
+    add('主送及普通正文左对齐，任职条目不居中', 'fail' if alignment_issues else 'pass', alignment_issues,
+        'error' if alignment_issues else 'info')
     add("正文条目末尾标点", "pass" if not semicolon_hits else "review", semicolon_hits,
         "error" if semicolon_hits and not args.appointment_notice else "info")
 
@@ -577,15 +588,32 @@ def main():
     separate_signature = bool(companies) and (mine is None or any(p.text.strip() == mine for _, p in paragraphs))
     add('公司与矿名在独立段落分行', 'pass' if separate_signature else 'fail',
         {'company_paragraph_count': len(companies), 'mine': mine}, 'info' if separate_signature else 'error')
+    signature_paragraphs = ([companies[-1], dates[-1]] if companies and dates else [])
+    mine_paragraphs = [p for _, p in paragraphs if mine and p.text.strip() == mine]
+    if mine_paragraphs:
+        signature_paragraphs.append(mine_paragraphs[-1])
+    def signature_area(paragraph):
+        attrs = effective_ppr(paragraph, 'ind')
+        return tuple(float(attrs.get(modern, attrs.get(legacy, '0'))) for modern, legacy in
+                     [('start', 'left'), ('end', 'right'), ('startChars', 'leftChars'), ('endChars', 'rightChars')])
     signature_ok = bool(companies and dates) and all(
-        p._p.xpath('./w:pPr/w:jc[@w:val="center"]') and
-        p.paragraph_format.left_indent == companies[-1].paragraph_format.left_indent and
-        p.paragraph_format.right_indent == companies[-1].paragraph_format.right_indent
-        for p in (companies[-1], dates[-1])
+        effective_ppr(p, 'jc').get('val') == 'center' and signature_area(p) == signature_area(companies[-1])
+        for p in signature_paragraphs
     )
-    add("公司落款与日期在同一对齐区域居中", "pass" if signature_ok else "review",
-        {"company_found": bool(companies), "date_found": bool(dates), "note": "结构校验不能替代实际字形居中的渲染检查"},
+    add("公司落款、矿名与日期在同一对齐区域居中", "pass" if signature_ok else "review",
+        {"company_found": bool(companies), "date_found": bool(dates), 'mine_found': bool(mine_paragraphs),
+         "note": "结构校验不能替代实际字形居中的渲染检查"},
         "info" if signature_ok else "error")
+    signature_position_issues = []
+    for p in signature_paragraphs:
+        attrs = effective_ppr(p, 'ind')
+        extra = {key: attrs[key] for key in ('firstLine', 'firstLineChars', 'hanging', 'hangingChars')
+                 if float(attrs.get(key, '0')) != 0}
+        if extra or p.text != p.text.strip() or '\t' in p.text:
+            signature_position_issues.append({'text': p.text, 'first_line_or_hanging': extra,
+                                               'padding_or_tab': p.text != p.text.strip() or '\t' in p.text})
+    add('落款无首行/悬挂字符缩进及用于定位的空格或制表位', 'fail' if signature_position_issues else 'pass',
+        signature_position_issues, 'error' if signature_position_issues else 'info')
     expected_values = [("公司名", args.expected_company)]
     if args.expected_mine:
         expected_values.append(("矿名", args.expected_mine))
