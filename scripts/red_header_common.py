@@ -10,6 +10,17 @@ CHINESE_NUMBER = r"[一二三四五六七八九十百]+"
 CLOSINGS = ("特此请示", "特此报告", "特此通知", "特此函复", "特此复函", "妥否，请批示", "妥否请批示")
 
 
+def external_document_number(value, *, sign_type, inspection_material=False):
+    """Apply the external prefix without inventing a year or serial number."""
+    if sign_type != 'external' or inspection_material or not value or value == '〔发文字号待补〕':
+        return value
+    compact = re.sub(r'\s+', '', value)
+    match = re.fullmatch(r'蒙力煤[字号发]*([〔（(]\d{4}[〕）)]\d+号)', compact)
+    if not match:
+        raise ValueError('外发文号须为蒙力煤发〔年度〕序号号；无法识别年度和序号时须明确，不自动编造。')
+    return '蒙力煤发' + match[1]
+
+
 def independent_heading(text):
     text = text.strip()
     match = re.match(rf"^(?:{CHINESE_NUMBER}、|第{CHINESE_NUMBER}章)\s*(.+)$", text)

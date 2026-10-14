@@ -26,7 +26,8 @@ from apply_red_header_docx import (
 )
 from red_header_common import (attachment_start, closing, independent_heading, numbered_level,
                                safe_blank, spacing_issues, indent_issues, run_format_issues,
-                               effective_ppr, on, source_bold_map, text_runs, effective_bold, tail_layout)
+                               effective_ppr, on, source_bold_map, text_runs, effective_bold, tail_layout,
+                               external_document_number)
 
 try:
     from docx import Document
@@ -233,7 +234,7 @@ def main():
          "paragraph_indents": [bool(p._p.xpath('./w:pPr/w:ind')) for p in red_headers],
          "note": "仍需在WPS/Word逐页核对两行左右齐平及整体居中"},
         "info" if header_text_and_spacing_ok else "error")
-    issuing_number = "" if args.blank_document_number else (args.issuing_number or next(
+    detected_number = next(
         (
             p.text.strip()
             for _, p in paragraphs
@@ -241,9 +242,19 @@ def main():
             or p.text.strip() == "〔发文字号待补〕"
         ),
         "",
-    ))
+    )
+    issuing_number = "" if args.blank_document_number else (args.issuing_number or detected_number)
+    if args.issuing_number and not args.blank_document_number:
+        try:
+            issuing_number = external_document_number(issuing_number, sign_type=args.sign_type, inspection_material=args.inspection_material)
+        except ValueError as exc:
+            parser.error(str(exc))
     number_paragraphs = ([p for _, p in paragraphs if p.text.strip() == issuing_number]
                          if issuing_number else [])
+    if args.sign_type == 'external' and not args.inspection_material and issuing_number and issuing_number != '〔发文字号待补〕':
+        external_prefix_ok = bool(re.fullmatch(r'蒙力煤发〔\d{4}〕\d+号', detected_number))
+        add('外发文号使用蒙力煤发，年度及序号沿用已确认值', 'pass' if external_prefix_ok else 'fail',
+            {'document_number': detected_number, 'expected_number': issuing_number, 'expected_prefix': '蒙力煤发'}, 'info' if external_prefix_ok else 'error')
     if not args.title:
         filename_number = issuing_number or '〔发文字号待补〕'
         filename_ok = args.docx.name.startswith(filename_number + '：') and bool(args.docx.stem[len(filename_number) + 1:].strip())

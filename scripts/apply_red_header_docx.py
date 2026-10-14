@@ -22,7 +22,8 @@ from docx.oxml.ns import qn
 from docx.shared import Mm, Pt, RGBColor
 
 from red_header_common import (attachment_start, closing, independent_heading, safe_blank, spacing_issues,
-                               ppr_layers, bold_snapshot, mapped_bold, effective_bold, text_runs, furniture, tail_layout)
+                               ppr_layers, bold_snapshot, mapped_bold, effective_bold, text_runs, furniture, tail_layout,
+                               external_document_number)
 
 
 RED = "FF0000"
@@ -621,6 +622,7 @@ def apply(
         if len(existing_numbers) > 1:
             raise ValueError('原稿存在多个不同文号，须明确传入--issuing-number，不自动选取。')
         issuing_number = existing_numbers[0] if existing_numbers else '〔发文字号待补〕'
+    issuing_number = external_document_number(issuing_number, sign_type=sign_type, inspection_material=inspection_material)
     full_title = canonical_title(title + "".join(title_continuations or []))
     output_path = output_path.with_name(official_filename(full_title, issuing_number))
     if input_path.resolve() == output_path.resolve():

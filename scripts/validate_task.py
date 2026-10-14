@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from red_header_common import external_document_number
 
 
 def value(data: dict, *keys: str) -> str:
@@ -85,6 +86,15 @@ def main() -> int:
         notes.append("迎检内发文：生成和校验均须传 --inspection-material；无签发人/印发栏，不要求抄送及印数")
         if sign_type == "external":
             warnings.append("迎检标记与外发选择冲突：须确认文件类型，不静默当作普通内发文")
+    resolved_document_no = fields['发文字号']
+    if sign_type == 'external' and not inspection:
+        notes.append('外发文正文及文件名使用蒙力煤发〔年度〕序号号，年度和序号取用户确认值或原稿，不自动编造')
+        try:
+            resolved_document_no = external_document_number(resolved_document_no, sign_type=sign_type)
+        except ValueError as exc:
+            errors.append(str(exc))
+        if resolved_document_no != fields['发文字号']:
+            notes.append('输入文号前缀已按外发口径调整为蒙力煤发，年度和序号保留')
     appointment = payload.get('appointmentNotice', red.get('appointment_notice', False))
     no_title = payload.get('noTitle', red.get('no_title', False))
     for name, flag in [('appointmentNotice', appointment), ('noTitle', no_title)]:
@@ -123,6 +133,7 @@ def main() -> int:
         "source_file_count": len(source_files),
         "sign_type": sign_type,
         "inspection_material": inspection,
+        'resolved_document_no': resolved_document_no,
         "appointment_notice": appointment,
         "no_title": no_title,
         "output_mode": output_mode,

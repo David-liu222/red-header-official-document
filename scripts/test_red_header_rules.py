@@ -841,5 +841,53 @@ class HeaderRulesTest(unittest.TestCase):
                             for c in self.failures(json.loads(result.stdout))))
 
 
+    def test_external_normalizes_number_in_body_and_filename(self):
+        output, doc = self.generate(sign_type='external')
+        expected = '蒙力煤发〔2026〕1号'
+        self.assertEqual(doc.paragraphs[2].text, expected)
+        self.assertEqual(output.name, expected + '：' + TITLE + '.docx')
+        code, report = self.validate(output, '--sign-type', 'external', '--issuing-number', NUMBER)
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_external_source_number_is_normalized_without_argument(self):
+        source = self.custom_source()
+        doc = Document(source)
+        doc.paragraphs[0].insert_paragraph_before(NUMBER)
+        doc.save(source)
+        original = source.read_bytes()
+        output = apply(source, self.root / 'source-number/out.docx', title=TITLE, sign_type='external')
+        self.assertEqual(Document(output).paragraphs[2].text, '蒙力煤发〔2026〕1号')
+        self.assertEqual(source.read_bytes(), original)
+        code, report = self.validate(output, '--source', str(source), '--sign-type', 'external')
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_external_keeps_number_year_and_serial(self):
+        output, doc = self.generate(sign_type='external', issuing_number='蒙力煤字〔2025〕007号')
+        expected = '蒙力煤发〔2025〕007号'
+        self.assertEqual(doc.paragraphs[2].text, expected)
+        self.assertEqual(output.name, expected + '：' + TITLE + '.docx')
+        self.assertIn('2026年9月1日', [p.text for p in doc.paragraphs])
+
+    def test_external_validator_rejects_internal_prefix(self):
+        output, doc = self.generate(sign_type='external')
+        doc.paragraphs[2].runs[0].text = NUMBER
+        wrong = output.with_name(NUMBER + '：' + TITLE + '.docx')
+        doc.save(wrong)
+        code, report = self.validate(wrong, '--sign-type', 'external')
+        self.assertEqual(code, 1)
+        self.assertTrue(any(c['rule'].startswith('外发文号使用蒙力煤发') for c in self.failures(report)))
+
+    def test_web_external_number_resolution(self):
+        path = self.root / 'external-task.json'
+        path.write_text(json.dumps({'task_type': 'office_red_head_document', 'skill_name': 'red-header-official-document',
+                                    'output_folder': str(self.root / 'output'), 'payload': {'title': TITLE,
+                                    'body': '按测试要求办理。', 'recipient': '外部测试单位：', 'signType': 'external',
+                                    'documentNo': '蒙力煤字〔2025〕007号'}}, ensure_ascii=False))
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('validate_task.py')), str(path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)['resolved_document_no'], '蒙力煤发〔2025〕007号')
+
+
 if __name__ == "__main__":
     unittest.main()
