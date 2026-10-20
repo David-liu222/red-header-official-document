@@ -89,7 +89,7 @@ def reset_indent(paragraph, chars=0):
     for node in list(ppr.findall(qn('w:ind'))):
         ppr.remove(node)
     ind = OxmlElement('w:ind')
-    for key in ('left', 'right', 'start', 'end'):
+    for key in ('left', 'right', 'start', 'end', 'leftChars', 'rightChars', 'startChars', 'endChars', 'hanging', 'hangingChars'):
         ind.set(qn('w:' + key), '0')
     ind.set(qn('w:firstLine'), str(round(chars * 280)))
     ind.set(qn('w:firstLineChars'), str(round(chars * 100)))
@@ -203,6 +203,28 @@ def trim_post_signature_blank_pages(doc):
         body.append(deepcopy(section))
     for node in breaks + blanks:
         node.getparent().remove(node)
+
+
+def trim_recipient_leading_whitespace(paragraph):
+    """Remove padding at each visible line start without rebuilding runs or marks."""
+    line_start = True
+    for node in list(paragraph._p.iter()):
+        if node.tag == qn('w:t'):
+            chars = []
+            for char in node.text or '':
+                if char in '\r\n':
+                    chars.append(char)
+                    line_start = True
+                elif line_start and char.isspace():
+                    continue
+                else:
+                    chars.append(char)
+                    line_start = False
+            node.text = ''.join(chars)
+        elif node.tag == qn('w:tab') and line_start:
+            node.getparent().remove(node)
+        elif node.tag in (qn('w:br'), qn('w:cr')):
+            line_start = True
 
 
 def enable_title_auto_spacing(paragraph):
@@ -794,12 +816,10 @@ def apply(
 
     # Main recipient is top-aligned; keep its text intact and remove accidental leading spaces.
     if recipient is not None:
-        text = recipient.text.strip()
-        if text != recipient.text:
-            replace_text(recipient, text)
+        trim_recipient_leading_whitespace(recipient)
         recipient.alignment = WD_ALIGN_PARAGRAPH.LEFT
         set_spacing(recipient, indent_pt=None)
-        for run in recipient.runs:
+        for run in text_runs(recipient):
             set_run(run, font=BODY_FONT, size=14, bold=True)
 
     if title_lines:

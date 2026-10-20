@@ -108,6 +108,7 @@ def main() -> int:
         if appointment is not True:
             errors.append('noTitle 只用于任职类迎检原稿无标题分支')
         notes.append('原稿无正文标题：--title仅作文件名标签；生成和校验均传 --no-title')
+    notes.append('主送单位顶格、零缩进且每行开头无定位空格；完整渲染后传--page-images检查全篇空白页，未完成不得声称已满足')
     output_mode = value(payload, "outputMode") or value(red, "output_mode") or "docxOnly"
     if output_mode == "docxPdf":
         warnings.append("输出模式 docxPdf 已废弃：按 docxOnly 执行，不产出 PDF")

@@ -213,7 +213,7 @@ def source_bold_map(source, output):
 
 
 def tail_layout(doc):
-    """Inspect only the suffix after a dated signature or distribution block."""
+    """Inspect the blank suffix after the last real paragraph, including attachments."""
     from docx.text.paragraph import Paragraph
     nodes = list(doc._element.body)
     if nodes and nodes[-1].tag == qn('w:sectPr'):
@@ -228,8 +228,7 @@ def tail_layout(doc):
         blanks.insert(0, nodes.pop())
     anchor = Paragraph(nodes[-1], doc._body) if nodes and nodes[-1].tag == qn('w:p') else None
     value = re.sub(r'\s+', '', anchor.text) if anchor else ''
-    applicable = bool(anchor and (re.fullmatch(r'\d{4}年\d{1,2}月\d{1,2}日', value) or
-                                 re.match(r'(?:发文|印发)[:：]', value)))
+    applicable = bool(anchor and (value or anchor._p.xpath('.//w:drawing | .//w:pict | .//w:object')))
     breaks = []
     if applicable:
         for child in reversed(list(anchor._p)):
@@ -276,6 +275,43 @@ def indent_issues(paragraph, *, chars):
     if abs(actual - chars) > 0.05:
         issues['first_line_chars'] = actual
     return issues
+
+
+def recipient_layout_issues(paragraph):
+    issues = indent_issues(paragraph, chars=0)
+    attrs = effective_ppr(paragraph, 'ind')
+    for key in ('firstLine', 'firstLineChars', 'hanging', 'hangingChars'):
+        if float(attrs.get(key, '0')) != 0:
+            issues[key] = attrs[key]
+    alignment = effective_ppr(paragraph, 'jc').get('val', 'left')
+    if alignment not in ('left', 'start'):
+        issues['alignment'] = alignment
+    if re.search(r'(^|[\r\n])[^\S\r\n]+', paragraph.text):
+        issues['manual_leading_whitespace'] = True
+    return issues
+
+
+def rendered_page_content(folder, section):
+    """Check all numbered renderer PNGs, excluding page margins/header/footer."""
+    from PIL import Image, ImageOps
+    pages = sorted(((int(m[1]), p) for p in folder.glob('page-*.png')
+                    if (m := re.fullmatch(r'page-(\d+)\.png', p.name))), key=lambda item: item[0])
+    if not pages or [n for n, _ in pages] != list(range(1, len(pages) + 1)):
+        raise ValueError('须提供完整且连续的page-1.png至末页渲染图，不能用空目录或缺页截图验收。')
+    results = []
+    for number, path in pages:
+        with Image.open(path) as img:
+            width, height = img.size
+            box = (round(width * section.left_margin / section.page_width),
+                   round(height * section.top_margin / section.page_height),
+                   round(width * (1 - section.right_margin / section.page_width)),
+                   round(height * (1 - section.bottom_margin / section.page_height)))
+            if box[0] >= box[2] or box[1] >= box[3]:
+                raise ValueError('页面或页边距无有效正文区域，须检查实际渲染。')
+            histogram = ImageOps.grayscale(img.convert('RGB').crop(box)).histogram()
+            ink = sum(histogram[:220])
+            results.append({'page': number, 'body_ink_pixels': ink, 'blank_body': ink < 12})
+    return results
 
 
 def run_format_issues(run, *, font, size, bold, color=None):

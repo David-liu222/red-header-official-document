@@ -27,7 +27,7 @@ from apply_red_header_docx import (
 from red_header_common import (attachment_start, closing, independent_heading, numbered_level,
                                safe_blank, spacing_issues, indent_issues, run_format_issues,
                                effective_ppr, on, source_bold_map, text_runs, effective_bold, tail_layout,
-                               external_document_number)
+                               external_document_number, recipient_layout_issues, rendered_page_content)
 
 try:
     from docx import Document
@@ -136,6 +136,7 @@ def main():
     parser.add_argument("--signer-right-indent-pt", type=float, default=SIGNER_RIGHT_INDENT_PT,
                         help="按同类型正式样本核验签发栏右缩进，默认68磅")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
+    parser.add_argument('--page-images', type=Path, help='最终DOCX完整渲染PNG目录；逐页检测正文区域空白，不能用局部截图代替')
     args = parser.parse_args()
     if args.appointment_notice and not args.inspection_material:
         parser.error('任职通知原内容分支须声明迎检用途')
@@ -464,6 +465,10 @@ def main():
         add('原稿无主送分支', 'pass', '已显式传入--no-recipient；首段按正文检查')
     elif recipient_paragraph is None or not recipient_paragraph.text.strip().endswith(('：', ':')):
         add('主送单位可明确识别', 'fail', '首段不是明确的主送段；核对原稿，确无主送时生成与校验均传--no-recipient', 'error')
+    if recipient_paragraph is not None:
+        recipient_position = recipient_layout_issues(recipient_paragraph)
+        add('主送单位顶格：左对齐、零缩进、每行开头无空格或制表位',
+            'fail' if recipient_position else 'pass', recipient_position, 'error' if recipient_position else 'info')
     body_candidates = [
         (idx, p)
         for idx, p in paragraphs
@@ -658,8 +663,19 @@ def main():
     _, trailing_blanks, trailing_breaks, tail_applicable = tail_layout(doc)
     tail_issues = {'trailing_empty_paragraphs': len(trailing_blanks), 'trailing_breaks': len(trailing_breaks)} if tail_applicable else {}
     tail_bad = tail_applicable and bool(trailing_blanks or trailing_breaks)
-    add('落款后无可安全识别的空段及末尾分页', 'fail' if tail_bad else 'pass', tail_issues, 'error' if tail_bad else 'info')
+    add('文末无可安全识别的空段及末尾分页', 'fail' if tail_bad else 'pass', tail_issues, 'error' if tail_bad else 'info')
     add('落款后无多余空白页', 'manual', '逐页渲染至最后一页；仅有页码/页眉的页面仍为空白页，保留真实附件和业务内容')
+    if args.page_images:
+        try:
+            page_evidence = rendered_page_content(args.page_images, doc.sections[0])
+            blank_pages = [p['page'] for p in page_evidence if p['blank_body']]
+            add('完整渲染页面无多余空白页', 'fail' if blank_pages else 'pass',
+                {'page_count': len(page_evidence), 'blank_pages': blank_pages, 'pages': page_evidence},
+                'error' if blank_pages else 'info')
+        except (OSError, ValueError) as exc:
+            add('完整渲染页面无多余空白页', 'fail', str(exc), 'error')
+    else:
+        add('完整渲染页面无多余空白页', 'manual', '须传--page-images最终完整渲染目录并逐页目测；未提供图像不能宣称无空白页')
     if not args.title and not args.no_title:
         add("标题黑体二号，原有加粗保留", "manual", "请传入 --title 后自动检查标题段落")
     add("红头颜色、红线、右下角落款、页码和上长下短", "manual", "需渲染页面图片或用目标办公软件目测确认")

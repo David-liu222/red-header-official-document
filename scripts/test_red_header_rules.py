@@ -15,7 +15,8 @@ from docx.oxml.ns import qn
 from apply_red_header_docx import apply, set_paragraph_border
 from extract_review_comments import extract
 from validate_outputs import visible_files
-from red_header_common import bold_snapshot, compact_snapshot, effective_bold, text_runs
+from red_header_common import (bold_snapshot, compact_snapshot, effective_bold, text_runs,
+                               recipient_layout_issues, rendered_page_content)
 
 
 TITLE = "关于测试事项的通知"
@@ -639,7 +640,7 @@ class HeaderRulesTest(unittest.TestCase):
         doc.save(output)
         code, report = self.validate(output)
         self.assertEqual(code, 1)
-        self.assertTrue(any(c['rule'] == '落款后无可安全识别的空段及末尾分页' for c in self.failures(report)))
+        self.assertTrue(any(c['rule'] == '文末无可安全识别的空段及末尾分页' for c in self.failures(report)))
 
     def test_appointment_notice_keeps_original_arabic_items(self):
         source = self.custom_source(body=['1.按原内容办理。', '2.原有职责继续保留。'])
@@ -887,6 +888,111 @@ class HeaderRulesTest(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)['resolved_document_no'], '蒙力煤发〔2025〕007号')
+
+
+    def test_recipient_padding_is_removed_at_each_line_start(self):
+        source = self.custom_source()
+        doc = Document(source)
+        p = doc.paragraphs[1]
+        p.clear()
+        p.add_run(' \u3000')
+        run = p.add_run('\t公司各部门：\n\u3000\u3000相关单位：')
+        doc.add_comment(run, text='核对主送范围', author='示例审阅人')
+        p.paragraph_format.first_line_indent = Pt(28)
+        p.style.paragraph_format.left_indent = Pt(28)
+        doc.save(source)
+        before = source.read_bytes()
+        output = self.apply_custom(source)
+        p = next(p for p in Document(output).paragraphs if p.text.startswith('公司各部门'))
+        self.assertEqual(p.text, '公司各部门：\n相关单位：')
+        self.assertFalse(recipient_layout_issues(p))
+        self.assertEqual(extract(output)['comments'][0]['text'], '核对主送范围')
+        self.assertEqual(source.read_bytes(), before)
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_recipient_leading_padding_is_a_separate_failure(self):
+        for padding in ('  ', '\u3000\u3000', '\t'):
+            with self.subTest(padding=repr(padding)):
+                output = self.apply_custom(self.custom_source())
+                doc = Document(output)
+                p = next(p for p in doc.paragraphs if p.text == '公司各部门：')
+                p.runs[0].text = padding + p.runs[0].text
+                doc.save(output)
+                code, report = self.validate(output)
+                self.assertEqual(code, 1)
+                self.assertTrue(any(c['rule'].startswith('主送单位顶格：') for c in self.failures(report)))
+
+    def test_recipient_two_character_indent_is_rejected(self):
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited):
+                output = self.apply_custom(self.custom_source())
+                doc = Document(output)
+                p = next(p for p in doc.paragraphs if p.text == '公司各部门：')
+                layer = p.style._element.get_or_add_pPr() if inherited else p._p.pPr
+                if inherited:
+                    p._p.pPr.remove(p._p.pPr.find(qn('w:ind')))
+                ind = layer.find(qn('w:ind'))
+                if ind is None:
+                    ind = OxmlElement('w:ind'); layer.append(ind)
+                ind.set(qn('w:firstLineChars'), '200')
+                doc.save(output)
+                code, report = self.validate(output)
+                self.assertEqual(code, 1)
+                self.assertTrue(any(c['rule'].startswith('主送单位顶格：') for c in self.failures(report)))
+
+    def test_blank_suffix_after_real_attachment_is_cleaned(self):
+        source = self.custom_source()
+        doc = Document(source)
+        doc.add_paragraph('附件：示例说明')
+        doc.add_paragraph('附件中的真实业务内容必须保留。')
+        for _ in range(30):
+            doc.add_paragraph('')
+        doc.add_page_break()
+        doc.save(source)
+        output = self.apply_custom(source)
+        result = Document(output)
+        self.assertEqual(result.paragraphs[-1].text, '附件中的真实业务内容必须保留。')
+        self.assertIn('附件：示例说明', [p.text for p in result.paragraphs])
+        code, report = self.validate(output, '--source', str(source))
+        self.assertEqual(code, 0, self.failures(report))
+
+    def test_rendered_blank_middle_page_with_header_and_footer_is_rejected(self):
+        from PIL import Image, ImageDraw
+        output = self.apply_custom(self.custom_source())
+        pages = self.root / 'render'; pages.mkdir()
+        for n in (1, 2, 3):
+            img = Image.new('RGB', (840, 1188), 'white')
+            draw = ImageDraw.Draw(img)
+            draw.rectangle((110, 18, 230, 25), fill='black')
+            draw.rectangle((410, 1145, 430, 1152), fill='black')
+            if n != 2:
+                draw.rectangle((110, 145, 300, 160), fill='black')
+            img.save(pages / f'page-{n}.png')
+        evidence = rendered_page_content(pages, Document(output).sections[0])
+        self.assertEqual([p['page'] for p in evidence if p['blank_body']], [2])
+        code, report = self.validate(output, '--page-images', str(pages))
+        self.assertEqual(code, 1)
+        self.assertTrue(any(c['rule'] == '完整渲染页面无多余空白页' for c in self.failures(report)))
+        (pages / 'page-2.png').unlink()
+        code, report = self.validate(output, '--page-images', str(pages))
+        self.assertEqual(code, 1)
+
+    def test_rendered_content_page_passes_and_missing_images_remain_pending(self):
+        from PIL import Image, ImageDraw
+        output = self.apply_custom(self.custom_source())
+        pages = self.root / 'render'; pages.mkdir()
+        img = Image.new('RGB', (840, 1188), 'white')
+        ImageDraw.Draw(img).rectangle((110, 145, 300, 160), fill='red')
+        img.save(pages / 'page-1.png')
+        code, report = self.validate(output, '--page-images', str(pages))
+        self.assertEqual(code, 0, self.failures(report))
+        self.assertTrue(any(c['rule'] == '完整渲染页面无多余空白页' and c['status'] == 'pass' for c in report['checks']))
+        code, report = self.validate(output)
+        self.assertTrue(any(c['rule'] == '完整渲染页面无多余空白页' and c['status'] == 'manual' for c in report['checks']))
+        empty = self.root / 'empty'; empty.mkdir()
+        code, report = self.validate(output, '--page-images', str(empty))
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":
