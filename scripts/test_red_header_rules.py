@@ -17,6 +17,7 @@ from extract_review_comments import extract
 from validate_outputs import visible_files
 from red_header_common import (bold_snapshot, compact_snapshot, effective_bold, text_runs,
                                recipient_layout_issues, rendered_page_content)
+from revise_internal_execution_docx import revise as revise_execution, execution_issues, table_shape
 
 
 TITLE = "关于测试事项的通知"
@@ -993,6 +994,98 @@ class HeaderRulesTest(unittest.TestCase):
         empty = self.root / 'empty'; empty.mkdir()
         code, report = self.validate(output, '--page-images', str(empty))
         self.assertEqual(code, 1)
+
+
+    def execution_source(self):
+        source = self.custom_source(body=['三、工作要求', '（八）示例说明：', '1、按原有内容办理。',
+                                          '    四、原有独立标题', '1、正文引出要求：原有说明继续保留。'],
+                                    no_recipient=True, table=True)
+        doc = Document(source)
+        doc.paragraphs[0].insert_paragraph_before(NUMBER)
+        table = doc.tables[0]
+        for p in table._tbl.xpath('.//w:p'):
+            from docx.text.paragraph import Paragraph
+            Paragraph(p, table).paragraph_format.keep_with_next = True
+        doc.save(source)
+        return source
+
+    def test_execution_layout_preserves_content_and_formats_table(self):
+        source = self.execution_source()
+        before = source.read_bytes()
+        shape = table_shape(Document(source).tables[0])
+        output, changes = revise_execution(source, self.root / 'execution/out.docx', title=TITLE)
+        doc = Document(output)
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(table_shape(doc.tables[0]), shape)
+        self.assertIn('（八）示例说明', [p.text for p in doc.paragraphs])
+        self.assertIn('1.正文引出要求：原有说明继续保留。', [p.text for p in doc.paragraphs])
+        self.assertIn('四、原有独立标题', [p.text for p in doc.paragraphs])
+        self.assertFalse(execution_issues(doc, TITLE))
+        self.assertTrue(changes)
+
+    def test_execution_checker_detects_table_style_and_heading_regressions(self):
+        output, _ = revise_execution(self.execution_source(), self.root / 'execution/out.docx', title=TITLE)
+        doc = Document(output)
+        table = doc.tables[0]
+        table.cell(0, 0).paragraphs[0].runs[0].bold = False
+        table.cell(1, 0).paragraphs[0].runs[0].font.size = Pt(14)
+        p = next(p for p in doc.paragraphs if p.text == '（八）示例说明')
+        p.runs[0].text += '：'
+        issues = execution_issues(doc, TITLE)
+        self.assertTrue(any('表头加粗' in x['issue'] for x in issues))
+        self.assertTrue(any('独立括号小标题仍带冒号' == x['issue'] for x in issues))
+
+    def test_fixed_distribution_template_changes_only_subject_name(self):
+        source = self.execution_source()
+        doc = Document(source)
+        doc.add_paragraph('主题：旧名称')
+        doc.add_paragraph('抄送：旧范围')
+        doc.add_paragraph('发文：旧单位\t共印1份')
+        doc.save(source)
+        template = {'copy_to': '通用测试范围', 'issue_unit': '通用测试单位', 'print_count': 3}
+        output, _ = revise_execution(source, self.root / 'execution/out.docx', title=TITLE, distribution_template=template)
+        doc = Document(output)
+        self.assertEqual([p.text for p in doc.paragraphs[-3:]],
+                         ['主题：' + TITLE, '抄送：通用测试范围', '发文：通用测试单位\t共印3份'])
+        self.assertFalse(execution_issues(doc, TITLE, template))
+        with self.assertRaisesRegex(ValueError, '不自动猜测'):
+            revise_execution(source, self.root / 'bad/out.docx', title=TITLE, distribution_template={})
+
+    def test_execution_rejects_html_and_accepts_extensionless_word_package(self):
+        html = self.root / 'web.docx'; html.write_text('<html><body>测试网页</body></html>')
+        with self.assertRaisesRegex(ValueError, '不是可编辑的Word'):
+            revise_execution(html, self.root / 'html/out.docx', title=TITLE)
+        source = self.execution_source()
+        no_extension = source.with_suffix(''); source.rename(no_extension)
+        output, _ = revise_execution(no_extension, self.root / 'word/out', title=TITLE)
+        self.assertEqual(output.suffix, '.docx')
+        self.assertTrue(output.name.startswith(NUMBER + '：'))
+        self.assertFalse(execution_issues(Document(output), TITLE))
+
+    def test_confirmed_small_table_grouping_has_an_explicit_scope(self):
+        source = self.execution_source()
+        output, _ = revise_execution(source, self.root / 'execution/out.docx', title=TITLE, keep_together_tables=[1])
+        self.assertFalse(execution_issues(Document(output), TITLE, keep_together_tables=[1]))
+        with self.assertRaisesRegex(ValueError, '超出原稿表格范围'):
+            revise_execution(source, self.root / 'bad/out.docx', title=TITLE, keep_together_tables=[2])
+
+    def test_authorized_number_punctuation_changes_keep_source_emphasis(self):
+        from revise_internal_execution_docx import normalize_execution_paragraph
+        from red_header_common import source_bold_map
+        source = self.execution_source()
+        doc = Document(source)
+        for p in doc.paragraphs:
+            if p.text.startswith(('1、', '（八）')):
+                for r in p.runs:
+                    r.bold = True
+        doc.save(source)
+        output, _ = revise_execution(source, self.root / 'execution/out.docx', title=TITLE)
+        reference = Document(source)
+        for p in reference.paragraphs:
+            normalize_execution_paragraph(p)
+        _, dropped, equal = source_bold_map(reference, Document(output))
+        self.assertFalse(dropped)
+        self.assertTrue(equal)
 
 
 if __name__ == "__main__":

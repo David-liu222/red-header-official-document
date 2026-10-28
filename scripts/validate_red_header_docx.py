@@ -137,7 +137,14 @@ def main():
                         help="按同类型正式样本核验签发栏右缩进，默认68磅")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument('--page-images', type=Path, help='最终DOCX完整渲染PNG目录；逐页检测正文区域空白，不能用局部截图代替')
+    parser.add_argument('--execution-layout', action='store_true', help='真实执行内发文：表头居中加粗、仿宋小四固定22磅及序号/标点专项检查')
+    parser.add_argument('--distribution-template', type=Path, help='用户已确认的固定印发栏JSON；仅真实执行内发文适用')
+    parser.add_argument('--keep-table-together', type=int, action='append', default=[], help='与真实执行修正同步：已渲染确认可整页容纳的表格序号')
     args = parser.parse_args()
+    if args.execution_layout:
+        from revise_internal_execution_docx import subheading
+    if (args.execution_layout or args.distribution_template or args.keep_table_together) and (args.sign_type != 'internal' or args.inspection_material):
+        parser.error('真实执行排版及固定印发栏仅用于--sign-type internal且非迎检文件')
     if args.appointment_notice and not args.inspection_material:
         parser.error('任职通知原内容分支须声明迎检用途')
     if args.no_title and not args.appointment_notice:
@@ -146,11 +153,18 @@ def main():
     if args.docx.suffix.lower() != ".docx":
         raise SystemExit("只接受 .docx；旧 .doc 请先在副本上转换。")
     doc = Document(str(args.docx))
+    if any(i < 1 or i > len(doc.tables) for i in args.keep_table_together):
+        parser.error('整表同页的表格序号超出文档范围')
     source_masks, dropped_bold, source_content_equal = {}, [], None
     if args.source:
         if args.source.suffix.lower() != '.docx':
             parser.error('原稿须为只读DOCX副本；旧DOC先复制转换')
-        source_masks, dropped_bold, source_content_equal = source_bold_map(Document(args.source), doc)
+        source_document = Document(args.source)
+        if args.execution_layout:
+            from revise_internal_execution_docx import normalize_execution_paragraph
+            for p in source_document.paragraphs:
+                normalize_execution_paragraph(p)
+        source_masks, dropped_bold, source_content_equal = source_bold_map(source_document, doc)
     checks = []
 
     def add(rule, status, evidence, severity="info"):
@@ -554,10 +568,11 @@ def main():
         in_attachments = False
         level = numbered_level(text)
         if level is not None:
-            if not args.appointment_notice and ((previous_level is None and level > 1) or (previous_level is not None and level > previous_level + 1)):
+            direct_chapter_items = args.execution_layout and previous_level == 1 and level == 3
+            if not args.appointment_notice and not direct_chapter_items and ((previous_level is None and level > 1) or (previous_level is not None and level > previous_level + 1)):
                 hierarchy_issues.append({'paragraph': idx, 'text': text[:80], 'previous_level': previous_level, 'level': level})
             previous_level = level
-            if not args.appointment_notice and not independent_heading(text) and not text.endswith(('。', '：', ':')):
+            if not args.appointment_notice and not independent_heading(text) and not (args.execution_layout and subheading(text)) and not text.endswith(('。', '：', ':')):
                 punctuation_issues.append({'paragraph': idx, 'text': text[-100:], 'expected': '完整条目以。结束；冒号引出内容和独立小标题除外'})
     add('显式序号层级无跳级', 'fail' if hierarchy_issues else 'pass', hierarchy_issues, 'error' if hierarchy_issues else 'info')
     add('完整序号条目用句号结束', 'fail' if punctuation_issues else 'pass', punctuation_issues, 'error' if punctuation_issues else 'info')
@@ -682,6 +697,15 @@ def main():
     add("公司落款靠近版心右边界，矿名和日期以公司为基准居中", "manual", "核对公司名称实际字宽；不得仅凭固定220磅左缩进或与旧版相比平移5毫米验收")
     add('序号语义、附件范围及未知结束语', 'manual', '机械规则已独立检查；完整词语、条目是否完整与附件业务范围仍需逐页确认')
 
+    if args.execution_layout:
+        from revise_internal_execution_docx import execution_issues
+        template = json.loads(args.distribution_template.read_text()) if args.distribution_template else None
+        issues = execution_issues(doc, args.title or '', template, args.keep_table_together)
+        add('真实执行内发文表格、序号、缩进和标点专项检查', 'fail' if issues else 'pass', issues,
+            'error' if issues else 'info')
+        add('固定印发栏使用已确认模板且只替换文件名称', 'pass' if template is not None else 'manual',
+            '已核对模板' if template is not None else '须提供固定抄送范围、发文单位和份数，不能用占位文字冒充固定值')
+        add('渲染行首无逗号句号等闭合标点，表题与表格无大块留白', 'manual', '逐页检查，XML禁则和keepNext不是实际显示验收')
     failed = sum(c['status'] == 'fail' for c in checks)
     pending = sum(c['status'] in ('review', 'manual') for c in checks)
     report = {"file": str(args.docx), "checks": checks, "summary": {"total": len(checks),
